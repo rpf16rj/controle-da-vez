@@ -38,6 +38,7 @@ from windows_capture import WindowsCapture
 import aiortc.rtcrtpsender as _rtcrtpsender
 from aiortc.codecs import CODECS
 from aiortc.codecs.h264 import H264Encoder, PACKET_MAX
+from aiortc.mediastreams import VIDEO_TIME_BASE, convert_timebase
 
 # Timer do Windows em 1ms: sem isso asyncio.sleep(33ms) dorme ~45ms e o
 # pacing dos tracks limita a produção a ~21fps em vez de 30.
@@ -225,6 +226,105 @@ class HwH265Encoder(HwH264Encoder):
         return out
 
 
+class HwAV1Encoder(HwH264Encoder):
+    """AV1 via av1_nvenc (RTX 40xx) com packetização RTP RFC 9364.
+
+    O bitstream do nvenc é OBU low-overhead (cada OBU tem leb128 size). Para
+    RTP: header de agregação de 1 byte (Z|Y|W|N), temporal delimiter (tipo 2)
+    e padding (15) removidos, campo de tamanho do OBU header zerado (bit 1).
+    W=0 → cada OBU element carrega seu próprio tamanho LEB128; OBU maior que
+    o MTU fragmenta via flags Z/Y."""
+
+    CODEC_NAME = "av1_nvenc"
+
+    @staticmethod
+    def _leb128(n: int) -> bytes:
+        out = bytearray()
+        while True:
+            b = n & 0x7F
+            n >>= 7
+            out.append(b | (0x80 if n else 0))
+            if not n:
+                return bytes(out)
+
+    @classmethod
+    def _split_bitstream(cls, data: bytes):
+        out = []
+        i, n = 0, len(data)
+        while i < n:
+            h = data[i]
+            typ = (h >> 3) & 0xF
+            ext = (h >> 2) & 1
+            hs = (h >> 1) & 1
+            j = i + 1 + ext
+            if hs:
+                size, sh = 0, 0
+                while j < n:
+                    b = data[j]
+                    j += 1
+                    size |= (b & 0x7F) << sh
+                    if b < 0x80:
+                        break
+                    sh += 7
+            else:
+                size = n - j
+            if typ in (2, 15):  # temporal delimiter / padding: fora do RTP
+                i = j + size
+                continue
+            # OBU element = header (has_size zerado) + ext + payload
+            out.append(bytes([h & ~0x02]) + data[i + 1:j if hs else i + 1 + ext] + data[j:j + size])
+            i = j + size
+        return out
+
+    def _packetize(self, elements):
+        elements = list(elements)
+        if not elements:
+            return []
+        leb = self._leb128
+        out = []
+        cur = bytearray(1)  # byte 0 = aggregation header (preenche no flush)
+        first_pkt = True
+        # N = 1o pacote de uma coded video sequence: presente quando o frame
+        # carrega sequence header OBU (tipo 1) — keyframe com headers in-band.
+        n_flag = any((e[0] & 0x78) == 0x08 for e in elements)
+
+        def hdr(z, y):
+            nonlocal first_pkt
+            b = (0x80 if z else 0) | (0x40 if y else 0)  # W=0
+            if first_pkt and n_flag:
+                b |= 0x08
+            first_pkt = False
+            return b
+
+        def flush():
+            if len(cur) > 1:
+                cur[0] = hdr(0, 0)
+                out.append(bytes(cur))
+
+        for elem in elements:
+            size = leb(len(elem))
+            if 1 + len(size) + len(elem) > PACKET_MAX:
+                # OBU maior que o MTU: fragmenta em pacotes próprios (Z/Y).
+                flush()
+                frag_max = PACKET_MAX - 1 - len(size)
+                off = 0
+                while off < len(elem):
+                    frag = elem[off:off + frag_max]
+                    off += len(frag)
+                    out.append(
+                        bytes([hdr(off > len(frag), off < len(elem))])
+                        + leb(len(frag)) + frag
+                    )
+                cur = bytearray(1)
+                continue
+            if len(cur) + len(size) + len(elem) > PACKET_MAX:
+                flush()
+                cur = bytearray(1)
+            cur += size + elem
+        flush()
+        return out
+
+
 # Registra video/H265 no aiortc (não existe nativamente). O fmtp do answer sai
 # dos parameters locais — echo do profile/tier/tx-mode do Chrome; o level-id é
 # ajustado pro do offer remoto no handler /offer (RFC 7798 §7.3: level <= offer).
@@ -243,6 +343,22 @@ CODECS["video"] += [
     RTCRtpCodecParameters(
         mimeType="video/rtx", clockRate=90000, payloadType=106, parameters={"apt": 105}
     ),
+    # AV1: RTX 40xx encoda via av1_nvenc; Chrome (inclusive Android) oferece
+    # decode HW — melhor codec disponível no WebRTC mobile hoje.
+    RTCRtpCodecParameters(
+        mimeType="video/AV1",
+        clockRate=90000,
+        payloadType=107,
+        rtcpFeedback=[
+            RTCRtcpFeedback(type="nack"),
+            RTCRtcpFeedback(type="nack", parameter="pli"),
+            RTCRtcpFeedback(type="goog-remb"),
+        ],
+        parameters={"profile": "0"},
+    ),
+    RTCRtpCodecParameters(
+        mimeType="video/rtx", clockRate=90000, payloadType=108, parameters={"apt": 107}
+    ),
 ]
 
 
@@ -251,6 +367,8 @@ _orig_get_encoder = _rtcrtpsender.get_encoder
 
 def _patched_get_encoder(codec):
     mt = codec.mimeType.lower()
+    if mt == "video/av1":
+        return HwAV1Encoder()
     if mt == "video/h265":
         return HwH265Encoder()
     if mt == "video/h264":
@@ -933,9 +1051,10 @@ async def offer(request):
             # ofertando H265. Quem não oferta H265 simplesmente ignora o codec.
             prefs = [
                 c for c in RTCRtpSender.getCapabilities("video").codecs
-                if c.mimeType.lower() in ("video/h265", "video/h264")
+                if c.mimeType.lower() in ("video/av1", "video/h265", "video/h264")
             ]
-            prefs.sort(key=lambda c: 0 if c.mimeType.lower() == "video/h265" else 1)
+            order = {"video/av1": 0, "video/h265": 1, "video/h264": 2}
+            prefs.sort(key=lambda c: order.get(c.mimeType.lower(), 9))
             transceiver.setCodecPreferences(prefs)
 
     sdp_in = data.get("sdp", "")

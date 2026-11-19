@@ -821,6 +821,7 @@ async function connectLive(silent = false) {
       // HW (~86% dos Androids). Receiver caps (não sender): devices com só
       // decoder HEVC não listam H265 no sender, e o offer sairia H264-only.
       const all = RTCRtpReceiver.getCapabilities('video')?.codecs ?? [];
+      const av1 = all.filter(c => c.mimeType.toLowerCase() === 'video/av1');
       const h265 = all.filter(c => c.mimeType.toLowerCase() === 'video/h265');
       const h264 = all.filter(c => c.mimeType.toLowerCase() === 'video/h264');
       clientLog('video-caps', {
@@ -840,7 +841,12 @@ async function connectLive(silent = false) {
         }
       }
       if (!prefs) {
-        prefs = codecPref === 'h264' ? h264 : [...h265, ...h264];
+        if (codecPref === 'av1' && !av1.length) {
+          toast('Este browser não anuncia AV1. Caindo p/ H.264.');
+        }
+        prefs = codecPref === 'h264' ? h264
+          : codecPref === 'av1' ? (av1.length ? av1 : h264)
+          : [...av1, ...h265, ...h264];
       }
       if (prefs.length) transceiver.setCodecPreferences(prefs);
     } catch {}
