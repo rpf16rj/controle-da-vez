@@ -463,6 +463,17 @@ let pc = null, inputChannel = null, inputTimer = null, connectBusy = false;
 let seq = 0;
 const pendingAcks = new Map(); // seq -> timestamp de envio (performance.now)
 let inputRtt = null, inputProc = null;
+let negotiatedCodec = null; // 'video/H265' etc — lido do answer SDP; getStats confirma via codecId
+
+function sdpVideoCodec(sdp) {
+  const pt = sdp?.match(/m=video \d+ \S+ (\d+)/)?.[1];
+  if (!pt) return null;
+  const name = sdp.match(new RegExp(`a=rtpmap:${pt} (\\S+)/90000`));
+  return name ? `video/${name[1]}` : null;
+}
+function codecLabel(mime) {
+  return { 'video/H265': 'H.265', 'video/H264': 'H.264', 'video/VP8': 'VP8', 'video/VP9': 'VP9', 'video/AV1': 'AV1' }[mime] || (mime || '').replace('video/', '');
+}
 const video = $('#live-video');
 const liveVideo = video; // alias: updateStats sombreia 'video' com o stat inbound-rtp
 const ytFrame = $('#yt-live');
@@ -823,6 +834,7 @@ async function connectLive(silent = false) {
     const ans = await readJson(res);
     if (!res.ok) throw new Error(ans.error || 'Falha ao contatar o agente.');
     await pc.setRemoteDescription(ans);
+    negotiatedCodec = sdpVideoCodec(ans.sdp);
     startInputLoop();
     startStatsLoop();
     if (!silent) toast('Live conectada. Entre na fila, confirme seu turno e controle com gamepad, WASD ou touch.');
@@ -842,7 +854,7 @@ function disconnectLive(message) {
   sendNeutral();
   if (inputChannel) { try { inputChannel.close(); } catch {} }
   if (pc) pc.close();
-  pc = null; inputChannel = null; sentActiveFlag = false; inputRtt = inputProc = null;
+  pc = null; inputChannel = null; sentActiveFlag = false; inputRtt = inputProc = null; negotiatedCodec = null;
   video.pause(); video.srcObject = null; video.hidden = true;
   $('#screen-placeholder').hidden = false;
   const [label, cls] = hostPill();
@@ -1091,28 +1103,35 @@ async function updateStats() {
   try {
     const report = await pc.getStats();
     let video = null, pair = null, localCand = null, remoteCand = null;
-    const candidates = new Map();
+    const candidates = new Map(), codecMap = new Map();
     report.forEach(r => { if (r.type === 'local-candidate' || r.type === 'remote-candidate') candidates.set(r.id, r); });
     report.forEach(r => {
       if (r.type === 'inbound-rtp' && r.kind === 'video' && !video) video = r;
-      if (r.type === 'candidate-pair' && r.state === 'succeeded' && r.nominated && !pair) pair = r;
+      else if (r.type === 'candidate-pair' && r.state === 'succeeded' && r.nominated && !pair) pair = r;
+      else if (r.type === 'codec') codecMap.set(r.id, r);
     });
     if (pair) {
       localCand = candidates.get(pair.localCandidateId);
       remoteCand = candidates.get(pair.remoteCandidateId);
     }
-    const parts = [];
-    if (pair?.currentRoundTripTime != null) parts.push(`RTT ${(pair.currentRoundTripTime * 1000).toFixed(0)}ms`);
-    if (inputRtt != null) parts.push(`input ${(inputRtt).toFixed(0)}ms`);
-    if (inputProc != null) parts.push(`proc ${inputProc.toFixed(1)}ms`);
+    const codecMime = (video?.codecId && codecMap.get(video.codecId)?.mimeType) || negotiatedCodec;
+    const m = []; // [rótulo, valor]
+    const head = [];
+    if (codecMime) {
+      const cls = codecMime === 'video/H265' ? 'hevc' : codecMime === 'video/H264' ? 'avc' : 'other';
+      head.push(`<span class="hud-codec ${cls}">${codecLabel(codecMime)}</span>`);
+    }
+    if (pair?.currentRoundTripTime != null) m.push(['RTT', `${(pair.currentRoundTripTime * 1000).toFixed(0)}ms`]);
+    if (inputRtt != null) m.push(['input', `${inputRtt.toFixed(0)}ms`]);
+    if (inputProc != null) m.push(['proc', `${inputProc.toFixed(1)}ms`]);
     if (video) {
       const jitterMs = (video.jitterBufferDelay != null && video.jitterBufferTarget != null && video.jitterBufferTarget > 0)
         ? (video.jitterBufferDelay / video.jitterBufferTarget) * 1000 : null;
-      if (jitterMs != null) parts.push(`buf ${jitterMs.toFixed(0)}ms`);
-      else if (video.jitter != null) parts.push(`jit ${(video.jitter * 1000).toFixed(0)}ms`);
+      if (jitterMs != null) m.push(['buf', `${jitterMs.toFixed(0)}ms`]);
+      else if (video.jitter != null) m.push(['jit', `${(video.jitter * 1000).toFixed(0)}ms`]);
       if (video.packetsLost != null && video.packetsReceived > 0) {
         const loss = video.packetsLost / (video.packetsLost + video.packetsReceived) * 100;
-        parts.push(`loss ${loss.toFixed(1)}%`);
+        m.push(['loss', `${loss.toFixed(1)}%`]);
       }
       // Catch-up: se o jitter buffer do browser acumular (soluços de rede/
       // decode no celular), acelera o playback sutilmente até drenar — sem
@@ -1121,17 +1140,24 @@ async function updateStats() {
         const rate = jitterMs > 350 ? 1.2 : jitterMs > 200 ? 1.08 : 1.0;
         if (liveVideo.playbackRate !== rate) liveVideo.playbackRate = rate;
       } else if (liveVideo.playbackRate !== 1.0) liveVideo.playbackRate = 1.0;
-      if (video.frameWidth) parts.push(`${video.frameWidth}×${video.frameHeight}`);
-      if (video.framesPerSecond != null) parts.push(`${video.framesPerSecond.toFixed(0)}fps`);
+      if (video.frameWidth) head.push(`<span class="hud-res">${video.frameWidth}×${video.frameHeight}</span>`);
+      if (video.framesPerSecond != null) head.push(`<span class="hud-main">${video.framesPerSecond.toFixed(0)}<i>fps</i></span>`);
       else if (video.framesDecoded != null && lastStatsSample?.framesDecoded != null) {
         const dt = (video.timestamp - lastStatsSample.timestamp) / 1000;
-        if (dt > 0) parts.push(`${((video.framesDecoded - lastStatsSample.framesDecoded) / dt).toFixed(0)}fps`);
+        if (dt > 0) head.push(`<span class="hud-main">${((video.framesDecoded - lastStatsSample.framesDecoded) / dt).toFixed(0)}<i>fps</i></span>`);
       }
       if (video.bytesReceived != null && lastStatsSample?.bytesReceived != null) {
         const dt = (video.timestamp - lastStatsSample.timestamp) / 1000;
-        if (dt > 0) parts.push(`${((video.bytesReceived - lastStatsSample.bytesReceived) * 8 / dt / 1e6).toFixed(1)}Mbps`);
+        if (dt > 0) head.push(`<span class="hud-main">${((video.bytesReceived - lastStatsSample.bytesReceived) * 8 / dt / 1e6).toFixed(1)}<i>Mbps</i></span>`);
       }
-      if (video.framesDropped) parts.push(`drop ${video.framesDropped}`);
+      if (video.totalDecodeTime != null && video.framesDecoded > 0) {
+        m.push(['dec', `${(video.totalDecodeTime / video.framesDecoded * 1000).toFixed(1)}ms`]);
+      }
+      if (video.framesDropped) m.push(['drop', `${video.framesDropped}`]);
+      if (video.freezeCount) m.push(['freeze', `${video.freezeCount}`]);
+      if (pair?.availableIncomingBitrate != null) {
+        m.push(['est', `${(pair.availableIncomingBitrate / 1e6).toFixed(1)}M`]);
+      }
       const dropDelta = (video.framesDropped ?? 0) - (lastStatsSample?.framesDropped ?? video.framesDropped ?? 0);
       // Jitter buffer adaptativo: ~8 amostras limpas → desce 10ms (piso 15ms,
       // ~1 frame a 60fps). Drop voltou → sobe pra 40ms na hora.
@@ -1158,8 +1184,10 @@ async function updateStats() {
       lastStatsSample = { framesDecoded: video.framesDecoded, framesDropped: video.framesDropped, bytesReceived: video.bytesReceived, timestamp: video.timestamp };
     }
     const pairType = [localCand?.candidateType, remoteCand?.candidateType].filter(Boolean).join('→');
-    if (pairType) parts.push(pairType);
-    $('#stats-hud').textContent = parts.join(' · ') || 'coletando…';
+    if (pairType) m.push(['via', pairType]);
+    $('#stats-hud').innerHTML = head.length || m.length
+      ? `<div class="hud-top">${head.join('')}</div><div class="hud-grid">${m.map(([k, v]) => `<span class="hud-m">${k}<b>${v}</b></span>`).join('')}</div>`
+      : 'coletando…';
   } catch {}
 }
 function startStatsLoop() {

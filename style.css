@@ -19,7 +19,18 @@
 #live-bar button:hover,#live-bar select:hover{border-color:var(--lime)}
 #live-bar button.on{border-color:var(--lime);color:var(--lime)}
 #live-bar select{appearance:none;-webkit-appearance:none;padding-right:20px;background-image:linear-gradient(45deg,transparent 50%,var(--muted) 50%),linear-gradient(135deg,var(--muted) 50%,transparent 50%);background-position:calc(100% - 14px) 55%,calc(100% - 9px) 55%;background-size:5px 5px;background-repeat:no-repeat}
-#stats-hud{position:absolute;top:42px;left:10px;z-index:7;background:#000a;color:#9fe870;font:10px/1.55 ui-monospace,Consolas,monospace;padding:5px 9px;border-radius:5px;pointer-events:none;max-width:72%;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#stats-hud{position:absolute;top:42px;left:10px;z-index:7;background:linear-gradient(180deg,#0d1117ee,#0a0d12e4);border:1px solid #ffffff1f;border-radius:8px;box-shadow:0 2px 10px #0009;color:#b8c4d0;font:10px/1.5 ui-monospace,Consolas,monospace;padding:6px 10px 7px;pointer-events:none;max-width:74%;backdrop-filter:blur(4px)}
+.hud-top{display:flex;align-items:center;gap:9px;margin-bottom:3px}
+.hud-codec{font-weight:700;font-size:9px;letter-spacing:.5px;padding:1px 6px;border-radius:4px}
+.hud-codec.hevc{background:#9fe8701f;color:#9fe870;border:1px solid #9fe87055}
+.hud-codec.avc{background:#5ab0ff1f;color:#5ab0ff;border:1px solid #5ab0ff55}
+.hud-codec.other{background:#ffffff14;color:#cdd6e0;border:1px solid #ffffff33}
+.hud-res{color:#e8eef5;font-weight:600}
+.hud-main{color:#9fe870;font-weight:700}
+.hud-main i{font-style:normal;color:#5f8a4f;font-weight:400;font-size:9px;margin-left:1px}
+.hud-grid{display:flex;flex-wrap:wrap;gap:2px 10px}
+.hud-m{color:#78848f;white-space:nowrap}
+.hud-m b{color:#cfd9e4;font-weight:600;margin-left:3px}
 #stats-hud[hidden]{display:none}
 #touch-pad{position:absolute;inset:0;z-index:8;pointer-events:none}
 #touch-pad[hidden]{display:none}
@@ -45,7 +56,9 @@
 @media (max-width:760px){
   #live-bar{top:38px;right:8px;gap:4px}
   #live-bar button,#live-bar select{padding:5px 8px;font-size:9px}
-  #stats-hud{top:38px;left:8px;font-size:9px;max-width:60%}
+  #stats-hud{top:38px;left:8px;font-size:9px;max-width:62%;padding:4px 7px 5px}
+  .hud-top{gap:6px}
+  .hud-grid{gap:1px 7px}
   .tp-zone{width:110px;height:110px}
   #tp-left{left:10px}#tp-right{right:10px}
   .tp-dpad{width:114px;height:114px;left:8px}
