@@ -27,8 +27,16 @@ async function boot() {
   }
   csrf = user.csrf;
   $('#admin-status').textContent = `Logado como ${user.name} · atualiza sozinho a cada 5s`;
+  $('#rtc-card').hidden = false;
   load();
   setInterval(load, 5000);
+}
+function renderRtc(st) {
+  if (!st) return;
+  const on = st.rtcEnabled !== false;
+  $('#rtc-state').textContent = on ? 'RTC ligado' : 'RTC DESLIGADO — jogando local';
+  $('#rtc-toggle-btn').textContent = on ? 'Desligar RTC' : 'Religar RTC';
+  $('#rtc-toggle-btn').className = on ? 'primary' : 'primary danger';
 }
 function statusLabel(u) {
   if (u.role === 'admin') return 'ADMIN';
@@ -37,6 +45,7 @@ function statusLabel(u) {
 async function load() {
   try {
     const st = await api('/api/state').catch(() => null);
+    renderRtc(st);
     const on = st?.online;
     $('#online-now').textContent = on ? `Online agora: ${on.viewers} (${on.logged} logado${on.logged === 1 ? '' : 's'}${on.viewers - on.logged > 0 ? ` + ${on.viewers - on.logged} público` : ''})${on.names.length ? ' — ' + on.names.join(', ') : ''}` : '';
     const { users } = await api('/api/admin/users');
@@ -119,6 +128,13 @@ async function act(userId, action) {
     load();
   } catch (e) { toast(e.message); }
 }
+$('#rtc-toggle-btn').addEventListener('click', async () => {
+  try {
+    const r = await api('/api/rtc-toggle', { method: 'POST', body: {} });
+    renderRtc({ rtcEnabled: r.rtcEnabled });
+    toast(r.rtcEnabled ? 'RTC religado.' : 'RTC desligado — sala mostra a live do canal.');
+  } catch (e) { toast(e.message); }
+});
 $('#admin-login-form').addEventListener('submit', async e => {
   e.preventDefault();
   try {

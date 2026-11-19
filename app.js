@@ -975,6 +975,26 @@ function updateScreenMode() {
   if (specKey !== lastSpecKey) { lastSpecKey = specKey; specFails = 0; specStopped = false; }
   $('#watch-btn').hidden = true;
   $('#screen-placeholder .wake-spin').hidden = false;
+  if (!rtcOn) {
+    // Modo local: admin desligou o RTC — todos veem o embed do canal
+    // (live em curso se houver, senão a última). autoplay=0 no embed.
+    if (pc) disconnectLive();
+    if (specPc) disconnectSpectator();
+    video.hidden = true;
+    if (ytUrl) {
+      if (ytFrame.getAttribute('src') !== ytUrl) ytFrame.src = ytUrl;
+      ytFrame.hidden = false;
+      $('#screen-placeholder').hidden = true;
+    } else {
+      if (!ytFrame.hidden) ytFrame.src = 'about:blank';
+      ytFrame.hidden = true;
+      $('#screen-placeholder').hidden = false;
+      $('#screen-load').textContent = 'Jogando local — site desligado pelo admin';
+    }
+    $('#screen-status').textContent = 'RTC DESLIGADO';
+    $('#screen-status').className = 'pill';
+    return;
+  }
   if (!mine && state?.spectatorMode === 'relay' && !specStopped && specFails < 3) {
     // Espectador: stream única do servidor (WHEP) — ativa sempre que o
     // chiaki está conectado ao PS5, com ou sem jogador no turno.

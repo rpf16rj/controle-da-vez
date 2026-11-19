@@ -74,7 +74,9 @@ async function agentOnline() {
 async function syncGrant(force = false) {
   room.tick();
   const playing = room.current ?? null;
-  const grant = playing ? { token: playing.turnToken, expiresAt: Date.now() + 30_000 } : { token: null };
+  // rtcEnabled=false: revoga o controle na hora (grant nulo) — quem estiver
+  // no turno perde o input imediatamente; modo local sem interrupções.
+  const grant = (playing && rtcEnabled) ? { token: playing.turnToken, expiresAt: Date.now() + 30_000 } : { token: null };
   const signature = JSON.stringify(grant);
   if (!force && signature === lastGrant) return;
   lastGrant = signature;
@@ -151,7 +153,8 @@ function clientPayload(uid, sid) {
     hostWaking: agentOnlineCache.waking,
     iceServers: ICE_SERVERS.length ? ICE_SERVERS : undefined,
     spectatorUrl: ytCache.url || SPECTATOR_URL || undefined,
-    spectatorMode: agentOnlineCache.publishing ? 'relay' : 'youtube',
+    // RTC off (modo local) → todo mundo vê o YouTube, nunca o relay do PS5.
+    spectatorMode: rtcEnabled && agentOnlineCache.publishing ? 'relay' : 'youtube',
     rtcEnabled,
     pixEnabled: PIX_ENABLED && Boolean(PIX_CODE),
     pixAmount: PIX_AMOUNT || undefined,
@@ -284,7 +287,7 @@ const server = http.createServer(async (req, res) => {
         ...room.snapshot(uid), hostOnline: agent.online, hostStreaming: agent.streaming, hostWaking: agent.waking,
         iceServers: ICE_SERVERS.length ? ICE_SERVERS : undefined,
         spectatorUrl: ytCache.url || SPECTATOR_URL || undefined,
-        spectatorMode: agent.publishing ? 'relay' : 'youtube',
+        spectatorMode: rtcEnabled && agent.publishing ? 'relay' : 'youtube',
         rtcEnabled,
         pixEnabled: PIX_ENABLED && Boolean(PIX_CODE), pixAmount: PIX_AMOUNT || undefined,
         ranking: store.ranking(5),
@@ -386,6 +389,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (path === '/api/whep') {
       // Espectadores: SDP -> MediaMTX (1 stream upstream, N viewers).
+      if (!rtcEnabled) return json(res, 503, { error: 'RTC desligado pelo admin.' });
       try {
         const sdp = JSON.parse(body || '{}').sdp;
         if (typeof sdp !== 'string' || sdp.length < 10) return json(res, 400, { error: 'SDP inválido.' });
@@ -445,17 +449,19 @@ const server = http.createServer(async (req, res) => {
       }
     }
     if (!auth) return json(res, 401, { error: 'Entre na sua conta primeiro.' });
+    // Telemetria leve: sendBeacon não consegue mandar X-CSRF-Token, então este
+    // endpoint fica fora do gate de CSRF (sem efeito colateral de estado).
+    if (path === '/api/client-log') {
+      try { const d = JSON.parse(body); console.log(`[client-log] ${auth?.user?.username ?? 'anon'}:`, JSON.stringify(d).slice(0, 500)); }
+      catch {}
+      return json(res, 200, { ok: true });
+    }
     const csrf = req.headers['x-csrf-token'];
     const csrfOk = typeof csrf === 'string' && csrf.length === auth.session.csrf.length && timingSafeEqual(Buffer.from(csrf), Buffer.from(auth.session.csrf));
     if (!csrfOk) return json(res, 403, { error: 'Sessão inválida. Atualize a página.' });
     if (path === '/api/logout') {
       store.closeSession(sid);
       res.setHeader('Set-Cookie', `cdv_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0`);
-      return json(res, 200, { ok: true });
-    }
-    if (path === '/api/client-log') {
-      try { const d = JSON.parse(body); console.log(`[client-log] ${auth?.user?.username ?? 'anon'}:`, JSON.stringify(d).slice(0, 500)); }
-      catch {}
       return json(res, 200, { ok: true });
     }
     if (path === '/api/chat') {

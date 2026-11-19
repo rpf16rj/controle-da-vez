@@ -53,7 +53,7 @@ STUN_URLS = os.environ.get("STUN_URLS", "stun:stun.l.google.com:19302").split(",
 TURN_URL = os.environ.get("TURN_URL", "")
 TURN_USER = os.environ.get("TURN_USER", "")
 TURN_PASS = os.environ.get("TURN_PASS", "")
-PS5_HOST = os.environ.get("PS5_HOST", "192.0.2.10")
+PS5_HOST = os.environ.get("PS5_HOST", "192.168.0.100")
 PS5_NICKNAME = os.environ.get("PS5_NICKNAME", "PS5-XXX")
 PS5_REGISTKEY = os.environ.get("PS5_REGISTKEY", "<PS5_REGISTKEY>")
 CHIAKI_EXE = os.environ.get("CHIAKI_EXE", r"C:\chiaki-ng-Win\chiaki.exe")
@@ -947,6 +947,11 @@ async def offer(request):
                 if lvl:
                     c.parameters["level-id"] = lvl.group(1)
                 print(f"h265 ofertado pelo cliente (pt={m.group(1)}, level-id={c.parameters.get('level-id')})", flush=True)
+    # debug temporário: ordem real dos codecs de vídeo no offer (por que h264
+    # vencia mesmo com h265 presente?)
+    for line in sdp_in.splitlines():
+        if line.startswith("m=video") or "H265/" in line or "H264/" in line:
+            print("OFR| " + line.strip(), flush=True)
 
     offer_sdp = RTCSessionDescription(sdp=sdp_in, type=data.get("type", "offer"))
     try:
@@ -1074,7 +1079,7 @@ async def grant(request):
 
 # ---------- Publicação única p/ espectadores (MediaMTX WHIP) ----------
 
-MTX_WHIP = os.environ.get("MTX_WHIP_URL", "http://<MTX_HOST>:8889/ps5/whip")
+MTX_WHIP = os.environ.get("MTX_WHIP_URL", "http://127.0.0.1:8889/ps5/whip")
 
 
 class WhipPublisher:

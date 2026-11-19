@@ -4,6 +4,13 @@
 <body class="admin-page">
 <header class="topbar"><a class="brand" href="/" aria-label="Controle da Vez, início"><span class="brand-icon">✚</span> CONTROLE<span>DA VEZ</span></a><nav aria-label="Admin"><a href="/">← Voltar à sala</a></nav></header>
 <main class="admin-main">
+<section class="admin-card" id="rtc-card" hidden>
+  <p class="eyebrow">MODO LOCAL</p>
+  <h1>Stream do site</h1>
+  <p class="muted" id="rtc-desc">Desligar o RTC corta o controle e os streams remotos — você joga local no PC sem interrupção, e a sala mostra a live do seu canal.</p>
+  <button class="primary" id="rtc-toggle-btn" type="button">Desligar RTC</button>
+  <span class="muted" id="rtc-state" style="margin-left:10px"></span>
+</section>
 <section class="admin-card">
   <p class="eyebrow">PAINEL DO ADMIN</p>
   <h1>Cadastros da sala</h1>
