@@ -928,12 +928,14 @@ async def offer(request):
             print("audio track falhou:", repr(exc), flush=True)
     for transceiver in pc.getTransceivers():
         if transceiver.kind == "video":
-            # Aceita H.265 (preferido pelo offer quando o browser suporta)
-            # e H.264 como fallback universal.
+            # H.265 primeiro: a ordem LOCAL decide o answer, não a do offer —
+            # sem o sort, H264 (antes no registry) vencia mesmo com o cliente
+            # ofertando H265. Quem não oferta H265 simplesmente ignora o codec.
             prefs = [
                 c for c in RTCRtpSender.getCapabilities("video").codecs
                 if c.mimeType.lower() in ("video/h265", "video/h264")
             ]
+            prefs.sort(key=lambda c: 0 if c.mimeType.lower() == "video/h265" else 1)
             transceiver.setCodecPreferences(prefs)
 
     sdp_in = data.get("sdp", "")

@@ -815,6 +815,7 @@ async function connectLive(silent = false) {
     };
     const transceiver = pc.addTransceiver('video', { direction: 'recvonly' });
     pc.addTransceiver('audio', { direction: 'recvonly' });
+    let injectH265 = false;
     try {
       // HEVC primeiro: Chrome 136+/Safari 18+ oferecem H265 quando há decoder
       // HW (~86% dos Androids). Receiver caps (não sender): devices com só
@@ -829,14 +830,33 @@ async function connectLive(silent = false) {
       let prefs;
       if (codecPref === 'h265') {
         if (h265.length) prefs = h265;
-        else toast('Este browser não anuncia H.265 (sem decoder HW/WebRTC). Caindo p/ Auto.');
+        else {
+          // Chrome/Android às vezes esconde H265 do getCapabilities mas tem
+          // decoder HW — injeta o codec no SDP do offer mesmo assim. Se não
+          // decodificar, o watchdog abaixo cai pra Auto em ~5s.
+          injectH265 = true;
+          prefs = h264;
+          toast('H.265 forçado via SDP — se a tela ficar preta, cai p/ Auto.');
+        }
       }
       if (!prefs) {
         prefs = codecPref === 'h264' ? h264 : [...h265, ...h264];
       }
       if (prefs.length) transceiver.setCodecPreferences(prefs);
     } catch {}
-    await pc.setLocalDescription(await pc.createOffer());
+    const offer = await pc.createOffer();
+    if (injectH265 && !/H265\/90000/.test(offer.sdp)) {
+      // PT 105 + fmtp compatível com o agente (level-id 150 = L5.0, o que
+      // o S23 anunciava quando aparecia).
+      const extra = 'a=rtpmap:105 H265/90000\r\n'
+        + 'a=rtcp-fb:105 nack\r\na=rtcp-fb:105 nack pli\r\na=rtcp-fb:105 goog-remb\r\n'
+        + 'a=fmtp:105 level-id=150;profile-id=1;tier-flag=0;tx-mode=SRST\r\n';
+      offer.sdp = offer.sdp
+        .replace(/^m=video (\d+ \S+) (.+)$/m, (s, head, pts) => `m=video ${head} 105 ${pts}`)
+        .replace(/(m=video [\s\S]*?)(a=candidate:)/m, (s, sec, cand) => sec + extra + cand);
+      clientLog('h265-inject', { ok: /H265\/90000/.test(offer.sdp) });
+    }
+    await pc.setLocalDescription(offer);
     await new Promise(resolve => {
       if (pc.iceGatheringState === 'complete') return resolve();
       const done = () => { if (pc.iceGatheringState === 'complete') resolve(); };
@@ -1136,7 +1156,7 @@ document.addEventListener('visibilitychange', () => {
 });
 
 // ---- Diagnóstico WebRTC ----
-let statsTimer = null, lastStatsSample = null;
+let statsTimer = null, lastStatsSample = null, h265BlindTicks = 0;
 async function updateStats() {
   if (!pc) return;
   try {
@@ -1154,6 +1174,21 @@ async function updateStats() {
       remoteCand = candidates.get(pair.remoteCandidateId);
     }
     const codecMime = (video?.codecId && codecMap.get(video.codecId)?.mimeType) || negotiatedCodec;
+    // Watchdog: H265 negociado mas 0 frames decodificados em ~5s = o browser
+    // não tem decoder de verdade (injeção forçada). Cai pra Auto e reconecta.
+    if (codecMime === 'video/H265' && video) {
+      if (video.framesDecoded === 0 && video.bytesReceived > 0) {
+        if (++h265BlindTicks >= 5) {
+          h265BlindTicks = 0;
+          clientLog('h265-blind-fallback', { bytes: video.bytesReceived });
+          toast('H.265 não decodificou neste browser — voltando p/ Auto.');
+          codecPref = 'auto'; localStorage.setItem('cdv-codec', 'auto');
+          const sel = $('#codec-sel'); if (sel) sel.value = 'auto';
+          disconnectLive(); connectLive();
+          return;
+        }
+      } else h265BlindTicks = 0;
+    }
     const m = []; // [rótulo, valor]
     const head = [];
     if (codecMime) {
