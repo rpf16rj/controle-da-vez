@@ -230,11 +230,12 @@ class HwAV1Encoder(HwH264Encoder):
     """AV1 via av1_nvenc (RTX 40xx) com packetização RTP RFC 9364.
 
     O bitstream do nvenc é OBU low-overhead (cada OBU tem leb128 size). Para
-    RTP: header de agregação de 1 byte (Z|Y|W|N), temporal delimiter (tipo 2)
-    e padding (15) removidos, e cada OBU vai INTEIRO (header+size+payload) —
-    zerar has_size mantendo os bytes de tamanho corrompia o OBU (tela preta).
-    W=0 → cada OBU element carrega seu próprio tamanho LEB128 na camada RTP;
-    OBU maior que o MTU fragmenta via flags Z/Y."""
+    RTP (RFC 9364, formato do libwebrtc): header de agregação (Z|Y|W|N),
+    temporal delimiter (tipo 2) e padding (15) removidos, e cada OBU element =
+    header com has_size ZERADO + ext + payload — sem os bytes de tamanho,
+    que a camada RTP transporta via LEB128/campo W. Elemento por pacote
+    (W=1); OBU maior que o MTU fragmenta via flags Z/Y; N no 1o pacote de
+    um keyframe que carrega sequence header (tipo 1)."""
 
     CODEC_NAME = "av1_nvenc"
 
@@ -271,7 +272,8 @@ class HwAV1Encoder(HwH264Encoder):
                 size = n - j
             end = j + size
             if typ not in (2, 15):  # temporal delimiter / padding: fora do RTP
-                out.append(data[i:end])
+                # element: header (has_size=0) + ext + payload — size removido
+                out.append(bytes([h & 0xFD]) + data[i + 1:i + 1 + ext] + data[j:end])
             i = end
         return out
 
@@ -279,48 +281,29 @@ class HwAV1Encoder(HwH264Encoder):
         elements = list(elements)
         if not elements:
             return []
-        leb = self._leb128
         out = []
-        cur = bytearray(1)  # byte 0 = aggregation header (preenche no flush)
         first_pkt = True
-        # N = 1o pacote de uma coded video sequence: presente quando o frame
-        # carrega sequence header OBU (tipo 1) — keyframe com headers in-band.
-        n_flag = any((e[0] & 0x78) == 0x08 for e in elements)
-
-        def hdr(z, y):
-            nonlocal first_pkt
-            b = (0x80 if z else 0) | (0x40 if y else 0)  # W=0
-            if first_pkt and n_flag:
-                b |= 0x08
-            first_pkt = False
-            return b
-
-        def flush():
-            if len(cur) > 1:
-                cur[0] = hdr(0, 0)
-                out.append(bytes(cur))
-
+        # N = 1o pacote da coded video sequence: frame chave traz seq header
+        # (tipo 1) como 1o OBU — nvenc só emite em keyframe, igual libwebrtc.
+        n_flag = 0x08 if (elements[0][0] & 0x78) == 0x08 else 0
         for elem in elements:
-            size = leb(len(elem))
-            if 1 + len(size) + len(elem) > PACKET_MAX:
-                # OBU maior que o MTU: fragmenta em pacotes próprios (Z/Y).
-                flush()
-                frag_max = PACKET_MAX - 1 - len(size)
+            if len(elem) <= PACKET_MAX - 1:
+                # W=1: um OBU element completo, sem campo de tamanho.
+                out.append(bytes([(0x10 | (n_flag if first_pkt else 0))]) + elem)
+            else:
+                # Fragmento: cada pacote leva 1 elemento (W=1), Z/Y marcam
+                # continuação. O elemento fragmentado é só fatia do OBU —
+                # header/ext saem naturalmente no 1o fragmento.
                 off = 0
+                frag_max = PACKET_MAX - 1
                 while off < len(elem):
                     frag = elem[off:off + frag_max]
                     off += len(frag)
-                    out.append(
-                        bytes([hdr(off > len(frag), off < len(elem))])
-                        + leb(len(frag)) + frag
-                    )
-                cur = bytearray(1)
-                continue
-            if len(cur) + len(size) + len(elem) > PACKET_MAX:
-                flush()
-                cur = bytearray(1)
-            cur += size + elem
-        flush()
+                    hdr = 0x10 | (0x80 if off > len(frag) else 0) | (0x40 if off < len(elem) else 0)
+                    if first_pkt:
+                        hdr |= n_flag
+                    out.append(bytes([hdr]) + frag)
+            first_pkt = False
         return out
 
 
