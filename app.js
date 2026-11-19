@@ -481,6 +481,7 @@ const screenEl = document.querySelector('.screen');
 const MODES = { foot: 'Pé', driving: 'Dirigindo', menu: 'Menu' };
 let controlMode = localStorage.getItem('cdv-mode') || 'foot';
 let qualityPref = localStorage.getItem('cdv-quality') || 'auto';
+let codecPref = localStorage.getItem('cdv-codec') || 'auto';
 // Auto-degrade: framesDropped crescendo = o aparelho não sustenta o perfil
 // (decode 1080p60 no celular, estouro de pacotes no Wi-Fi). Desce um degrau
 // do perfil a cada ~3s de drops até 'lite' — sem trocar a escolha do usuário.
@@ -525,6 +526,12 @@ $('#quality-sel').addEventListener('change', e => {
   localStorage.setItem('cdv-quality', qualityPref);
   degrade.applied = null; // escolha manual recomeça a lógica de auto-degrade
   sendVideoPref(qualityPref);
+});
+// Codec: muda só na próxima negociação — reconecta na hora se já estiver em RTC.
+$('#codec-sel').addEventListener('change', e => {
+  codecPref = e.target.value;
+  localStorage.setItem('cdv-codec', codecPref);
+  if (pc) { disconnectLive(); connectLive(true); }
 });
 
 // Mouse look: deltas acumulam no analógico direito e decaem rápido ao parar.
@@ -813,10 +820,20 @@ async function connectLive(silent = false) {
       // HW (~86% dos Androids). Receiver caps (não sender): devices com só
       // decoder HEVC não listam H265 no sender, e o offer sairia H264-only.
       const all = RTCRtpReceiver.getCapabilities('video')?.codecs ?? [];
-      const prefs = [
-        ...all.filter(c => c.mimeType.toLowerCase() === 'video/h265'),
-        ...all.filter(c => c.mimeType.toLowerCase() === 'video/h264'),
-      ];
+      const h265 = all.filter(c => c.mimeType.toLowerCase() === 'video/h265');
+      const h264 = all.filter(c => c.mimeType.toLowerCase() === 'video/h264');
+      clientLog('video-caps', {
+        recv: all.map(c => c.mimeType).join(','),
+        codec: codecPref,
+      });
+      let prefs;
+      if (codecPref === 'h265') {
+        if (h265.length) prefs = h265;
+        else toast('Este browser não anuncia H.265 (sem decoder HW/WebRTC). Caindo p/ Auto.');
+      }
+      if (!prefs) {
+        prefs = codecPref === 'h264' ? h264 : [...h265, ...h264];
+      }
       if (prefs.length) transceiver.setCodecPreferences(prefs);
     } catch {}
     await pc.setLocalDescription(await pc.createOffer());
@@ -1039,6 +1056,7 @@ function updateLiveUi() {
   $('#pad-show-btn').hidden = !(on && state?.current?.mine && isCoarse && (padAutoHide || padMode === 'off'));
   $('#mode-btn').textContent = `Modo: ${MODES[controlMode]}`;
   $('#quality-sel').value = qualityPref;
+  $('#codec-sel').value = codecPref;
   $('#stats-hud').hidden = !on;
 }
 function maybeAutoConnect() {
