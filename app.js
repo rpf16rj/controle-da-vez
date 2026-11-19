@@ -1180,16 +1180,17 @@ async function updateStats() {
       remoteCand = candidates.get(pair.remoteCandidateId);
     }
     const codecMime = (video?.codecId && codecMap.get(video.codecId)?.mimeType) || negotiatedCodec;
-    // Watchdog: H265 negociado mas 0 frames decodificados em ~5s = o browser
-    // não tem decoder de verdade (injeção forçada). Cai pra Auto e reconecta.
-    if (codecMime === 'video/H265' && video) {
+    // Watchdog: codec moderno negociado mas 0 frames decodificados em ~5s =
+    // browser não decodifica de verdade. Cai pra H.264 (universal), não Auto —
+    // senão o Auto voltaria pro mesmo codec e looparia.
+    if ((codecMime === 'video/H265' || codecMime === 'video/AV1') && video) {
       if (video.framesDecoded === 0 && video.bytesReceived > 0) {
         if (++h265BlindTicks >= 5) {
           h265BlindTicks = 0;
-          clientLog('h265-blind-fallback', { bytes: video.bytesReceived });
-          toast('H.265 não decodificou neste browser — voltando p/ Auto.');
-          codecPref = 'auto'; localStorage.setItem('cdv-codec', 'auto');
-          const sel = $('#codec-sel'); if (sel) sel.value = 'auto';
+          clientLog('codec-blind-fallback', { codec: codecMime, bytes: video.bytesReceived });
+          toast(`${codecLabel(codecMime)} não decodificou neste browser — voltando p/ H.264.`);
+          codecPref = 'h264'; localStorage.setItem('cdv-codec', 'h264');
+          const sel = $('#codec-sel'); if (sel) sel.value = 'h264';
           disconnectLive(); connectLive();
           return;
         }

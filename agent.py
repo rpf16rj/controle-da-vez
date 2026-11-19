@@ -231,9 +231,10 @@ class HwAV1Encoder(HwH264Encoder):
 
     O bitstream do nvenc é OBU low-overhead (cada OBU tem leb128 size). Para
     RTP: header de agregação de 1 byte (Z|Y|W|N), temporal delimiter (tipo 2)
-    e padding (15) removidos, campo de tamanho do OBU header zerado (bit 1).
-    W=0 → cada OBU element carrega seu próprio tamanho LEB128; OBU maior que
-    o MTU fragmenta via flags Z/Y."""
+    e padding (15) removidos, e cada OBU vai INTEIRO (header+size+payload) —
+    zerar has_size mantendo os bytes de tamanho corrompia o OBU (tela preta).
+    W=0 → cada OBU element carrega seu próprio tamanho LEB128 na camada RTP;
+    OBU maior que o MTU fragmenta via flags Z/Y."""
 
     CODEC_NAME = "av1_nvenc"
 
@@ -268,12 +269,10 @@ class HwAV1Encoder(HwH264Encoder):
                     sh += 7
             else:
                 size = n - j
-            if typ in (2, 15):  # temporal delimiter / padding: fora do RTP
-                i = j + size
-                continue
-            # OBU element = header (has_size zerado) + ext + payload
-            out.append(bytes([h & ~0x02]) + data[i + 1:j if hs else i + 1 + ext] + data[j:j + size])
-            i = j + size
+            end = j + size
+            if typ not in (2, 15):  # temporal delimiter / padding: fora do RTP
+                out.append(data[i:end])
+            i = end
         return out
 
     def _packetize(self, elements):
