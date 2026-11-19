@@ -175,6 +175,13 @@ function render() {
 let lastChatAt = -1;
 let chatReadAt = Date.now(); // não-lidas contam só mensagens novas desta sessão
 let prevApproved = null; // transição false→true = aprovado agora → toast
+let videoReceiver = null;
+let jitTarget = 40;
+let jitCalm = 0; // amostras seguidas sem drop — desce o buffer adaptativo
+function setJitTarget(ms) {
+  try { if (videoReceiver) videoReceiver.jitterBufferTarget = ms; } catch {}
+  try { if (videoReceiver) videoReceiver.playoutDelayHint = ms / 1000; } catch {}
+}
 let chatOlder = [], chatOlderMore = false, chatLoadingOlder = false, chatForceRender = false, chatKeepScroll = null;
 function fmtChatTime(at) {
   const d = new Date(at);
@@ -756,11 +763,12 @@ async function connectLive(silent = false) {
   try {
     pc = new RTCPeerConnection(state?.iceServers?.length ? { iceServers: state.iceServers } : undefined);
     pc.ontrack = e => {
-      // ~40ms de folga pro decoder do aparelho (a 60fps são só ~17ms por
-      // frame — alvo zero transformava qualquer pico de decode em frame
-      // pulado). jitterBufferTarget é em ms; playoutDelayHint em segundos.
-      try { e.receiver.jitterBufferTarget = 40; } catch {}
-      try { e.receiver.playoutDelayHint = 0.04; } catch {}
+      // Folga do decoder: começa em 40ms (a 60fps cada frame tem ~17ms —
+      // alvo zero transformava pico de decode em frame pulado) e o loop de
+      // stats desce adaptativo enquanto não houver drops (menos vidro).
+      videoReceiver = e.receiver;
+      jitTarget = 40;
+      setJitTarget(jitTarget);
       video.muted = false;
       video.srcObject = e.streams[0];
       video.hidden = false;
@@ -790,8 +798,14 @@ async function connectLive(silent = false) {
     const transceiver = pc.addTransceiver('video', { direction: 'recvonly' });
     pc.addTransceiver('audio', { direction: 'recvonly' });
     try {
-      const h264 = RTCRtpSender.getCapabilities('video')?.codecs.filter(c => c.mimeType.toLowerCase() === 'video/h264') ?? [];
-      if (h264.length) transceiver.setCodecPreferences(h264);
+      // HEVC primeiro: Chrome 136+/Safari 18+ oferecem H265 quando há decoder
+      // HW (~86% dos Androids). Se não houver, a lista fica só com H264.
+      const all = RTCRtpSender.getCapabilities('video')?.codecs ?? [];
+      const prefs = [
+        ...all.filter(c => c.mimeType.toLowerCase() === 'video/h265'),
+        ...all.filter(c => c.mimeType.toLowerCase() === 'video/h264'),
+      ];
+      if (prefs.length) transceiver.setCodecPreferences(prefs);
     } catch {}
     await pc.setLocalDescription(await pc.createOffer());
     await new Promise(resolve => {
@@ -1119,6 +1133,16 @@ async function updateStats() {
       }
       if (video.framesDropped) parts.push(`drop ${video.framesDropped}`);
       const dropDelta = (video.framesDropped ?? 0) - (lastStatsSample?.framesDropped ?? video.framesDropped ?? 0);
+      // Jitter buffer adaptativo: ~8 amostras limpas → desce 10ms (piso 15ms,
+      // ~1 frame a 60fps). Drop voltou → sobe pra 40ms na hora.
+      if (dropDelta >= 2) {
+        if (jitTarget !== 40) { jitTarget = 40; setJitTarget(jitTarget); }
+        jitCalm = 0;
+      } else if (++jitCalm >= 8 && jitTarget > 15) {
+        jitTarget = Math.max(15, jitTarget - 10);
+        setJitTarget(jitTarget);
+        jitCalm = 0;
+      }
       if (dropDelta >= 3) degrade.count++; else degrade.count = Math.max(0, degrade.count - 1);
       if (degrade.cooldown > 0) degrade.cooldown--;
       if (degrade.count >= 3 && degrade.cooldown <= 0) {

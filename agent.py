@@ -7,8 +7,10 @@ import asyncio
 import ctypes
 import ctypes.wintypes as wt
 import json
+import math
 import os
 import queue
+import re
 import socket
 import subprocess
 import threading
@@ -27,12 +29,15 @@ from aiortc import (
     VideoStreamTrack,
     AudioStreamTrack,
     RTCRtpSender,
+    RTCRtpCodecParameters,
 )
+from aiortc.rtcrtpparameters import RTCRtcpFeedback
 from vgamepad import VX360Gamepad, XUSB_BUTTON
 from windows_capture import WindowsCapture
 
 import aiortc.rtcrtpsender as _rtcrtpsender
-from aiortc.codecs.h264 import H264Encoder
+from aiortc.codecs import CODECS
+from aiortc.codecs.h264 import H264Encoder, PACKET_MAX
 
 # Timer do Windows em 1ms: sem isso asyncio.sleep(33ms) dorme ~45ms e o
 # pacing dos tracks limita a produção a ~21fps em vez de 30.
@@ -54,7 +59,11 @@ PS5_REGISTKEY = os.environ.get("PS5_REGISTKEY", "<PS5_REGISTKEY>")
 CHIAKI_EXE = os.environ.get("CHIAKI_EXE", r"C:\chiaki-ng-Win\chiaki.exe")
 
 FPS = 30
-VIDEO_BITRATE = 5_000_000
+# Jogador direto: alvo 20 Mbps (rede dedicada aguenta — pedido do operador).
+# O congestion control ainda pode baixar se a estimativa despencar, mas o
+# teto/ponto de partida é 20M.
+VIDEO_BITRATE = 20_000_000
+VIDEO_BITRATE_MAX = 20_000_000
 # Cap FIXO do relay público (720p30 pra espectadores). O perfil de
 # qualidade do jogador era aplicado globalmente: "lite" derrubava a live
 # pública junto e "auto" deixava subir até 10M na LAN pro mediamtx.
@@ -90,6 +99,8 @@ class HwH264Encoder(H264Encoder):
     """H264Encoder do aiortc usando h264_nvenc (NVENC, baixa latência)
     em vez de libx264."""
 
+    CODEC_NAME = "h264_nvenc"
+
     def _encode_frame(self, frame, force_keyframe):
         if self.codec and (
             frame.width != self.codec.width
@@ -106,7 +117,7 @@ class HwH264Encoder(H264Encoder):
             frame.pict_type = av.video.frame.PictureType.NONE
 
         if self.codec is None:
-            self.codec = av.CodecContext.create("h264_nvenc", "w")
+            self.codec = av.CodecContext.create(self.CODEC_NAME, "w")
             self.codec.width = frame.width
             self.codec.height = frame.height
             self.codec.bit_rate = self.target_bitrate
@@ -153,7 +164,7 @@ class HwH264Encoder(H264Encoder):
     def target_bitrate(self, bitrate):
         # Piso 1.2M: a estimativa do receiver pode despencar num soluço
         # momentâneo (ex.: screenshot no celular) — 500k deixava 1080p ilegível.
-        new = max(1_200_000, min(bitrate, 10_000_000))
+        new = max(1_200_000, min(bitrate, VIDEO_BITRATE_MAX))
         prev = getattr(self, "_last_tb", None)
         if prev is None or abs(new - prev) > 200_000:
             print(f"encoder bitrate: estimativa {bitrate/1e6:.2f}M -> alvo {new/1e6:.2f}M", flush=True)
@@ -165,11 +176,84 @@ class HwH264Encoder(H264Encoder):
         self.__target_bitrate = VIDEO_BITRATE
 
 
+NAL_TYPE_FU_HEVC = 49  # RFC 7798 §4.4.3 — Fragmentation Unit
+
+
+class HwH265Encoder(HwH264Encoder):
+    """HEVC via hevc_nvenc com packetização RTP RFC 7798.
+
+    Chrome 136+ / Safari 18+ negociam video/H265 quando existe decoder de
+    hardware. Layout difere do H.264: header NAL de 2 bytes (F|Type6|LayerId6|
+    TID3) e fragmentação via FU (tipo 49) em vez de FU-A.
+    VPS/SPS/PPS (tipos 32/33/34) já vêm in-band no bitstream do nvenc e saem
+    como NALs simples — não há sprop-* no SDP WebRTC."""
+
+    CODEC_NAME = "hevc_nvenc"
+
+    @staticmethod
+    def _packetize_fu(data: bytes) -> list[bytes]:
+        # PayloadHdr: copia F + LayerId/TID do NAL original, Type -> 49.
+        fu_ind = bytes([(data[0] & 0x81) | (NAL_TYPE_FU_HEVC << 1), data[1]])
+        nal_type = (data[0] >> 1) & 0x3F
+        payload = data[2:]
+        available = PACKET_MAX - 3
+        num = max(1, math.ceil(len(payload) / available))
+        size = len(payload) // num
+        larger = len(payload) % num
+
+        out, off = [], 0
+        while off < len(payload):
+            n = size + (1 if larger > 0 else 0)
+            larger = max(0, larger - 1)
+            frag = payload[off:off + n]
+            start = off == 0
+            off += n
+            fu_hdr = nal_type | (0x80 if start else 0) | (0x40 if off == len(payload) else 0)
+            out.append(fu_ind + bytes([fu_hdr]) + frag)
+        return out
+
+    @classmethod
+    def _packetize(cls, packages):
+        # NAL <= 1300 sai como pacote único (inclui VPS/SPS/PPS e slices
+        # pequenos); > 1300 fragmenta em FU. AP é opcional — não usado.
+        out = []
+        for nal in packages:
+            if len(nal) > PACKET_MAX:
+                out.extend(cls._packetize_fu(nal))
+            else:
+                out.append(nal)
+        return out
+
+
+# Registra video/H265 no aiortc (não existe nativamente). O fmtp do answer sai
+# dos parameters locais — echo do profile/tier/tx-mode do Chrome; o level-id é
+# ajustado pro do offer remoto no handler /offer (RFC 7798 §7.3: level <= offer).
+CODECS["video"] += [
+    RTCRtpCodecParameters(
+        mimeType="video/H265",
+        clockRate=90000,
+        payloadType=105,
+        rtcpFeedback=[
+            RTCRtcpFeedback(type="nack"),
+            RTCRtcpFeedback(type="nack", parameter="pli"),
+            RTCRtcpFeedback(type="goog-remb"),
+        ],
+        parameters={"profile-id": "1", "tier-flag": "0", "level-id": "123", "tx-mode": "SRST"},
+    ),
+    RTCRtpCodecParameters(
+        mimeType="video/rtx", clockRate=90000, payloadType=106, parameters={"apt": 105}
+    ),
+]
+
+
 _orig_get_encoder = _rtcrtpsender.get_encoder
 
 
 def _patched_get_encoder(codec):
-    if codec.mimeType.lower() == "video/h264":
+    mt = codec.mimeType.lower()
+    if mt == "video/h265":
+        return HwH265Encoder()
+    if mt == "video/h264":
         return HwH264Encoder()
     return _orig_get_encoder(codec)
 
@@ -693,6 +777,9 @@ class InputRelay:
         get_pad().reset()
 
 
+PLAYER_PCS = set()  # conexões diretas de jogador — uma só é legítima por vez
+
+
 async def offer(request):
     if not _authorized(request):
         return web.json_response({"error": "Não autorizado."}, status=401)
@@ -716,10 +803,17 @@ async def offer(request):
             )
         )
     pc = RTCPeerConnection(RTCConfiguration(iceServers=ice_servers))
+    # Só existe um jogador por vez — um pc anterior de /offer é sempre zumbi
+    # (reconexão da mesma pessoa). Cada um encoda+envia ~60fps: fecha na hora.
+    for old in list(PLAYER_PCS):
+        asyncio.ensure_future(old.close())
+    PLAYER_PCS.clear()
+    PLAYER_PCS.add(pc)
     relay = InputRelay()
     ACTIVE_RELAYS.add(relay)
 
     async def cleanup(_=None):
+        PLAYER_PCS.discard(pc)
         if audio_track:
             audio_track.stop()
         ACTIVE_RELAYS.discard(relay)
@@ -728,7 +822,19 @@ async def offer(request):
         relay.reset()
         await pc.close()
 
-    pc.on("connectionstatechange", lambda: asyncio.ensure_future(cleanup()) if pc.connectionState in ("failed", "closed") else None)
+    def _on_state_change():
+        if pc.connectionState in ("failed", "closed"):
+            asyncio.ensure_future(cleanup())
+        elif pc.connectionState == "disconnected":
+            # ICE "disconnected" pode ficar pendurado por minutos — encerra
+            # se não recuperar, em vez de encodar/enviar pra um peer morto.
+            async def _delayed():
+                await asyncio.sleep(12)
+                if pc.connectionState == "disconnected":
+                    await cleanup()
+            asyncio.ensure_future(_delayed())
+
+    pc.on("connectionstatechange", lambda: _on_state_change())
 
     def on_datachannel(channel):
         print("datachannel recebido", flush=True)
@@ -822,14 +928,35 @@ async def offer(request):
             print("audio track falhou:", repr(exc), flush=True)
     for transceiver in pc.getTransceivers():
         if transceiver.kind == "video":
-            h264 = [c for c in RTCRtpSender.getCapabilities("video").codecs if c.mimeType.lower() == "video/h264"]
-            transceiver.setCodecPreferences(h264)
+            # Aceita H.265 (preferido pelo offer quando o browser suporta)
+            # e H.264 como fallback universal.
+            prefs = [
+                c for c in RTCRtpSender.getCapabilities("video").codecs
+                if c.mimeType.lower() in ("video/h265", "video/h264")
+            ]
+            transceiver.setCodecPreferences(prefs)
 
-    offer_sdp = RTCSessionDescription(sdp=data.get("sdp", ""), type=data.get("type", "offer"))
+    sdp_in = data.get("sdp", "")
+    # Echo do level-id do offer: o answer herda nossos parameters locais, e
+    # RFC 7798 pede level <= ofertado (o decoder HW do cliente anuncia o dele).
+    m = re.search(r"a=rtpmap:(\d+)\s+H265/90000", sdp_in)
+    if m:
+        lvl = re.search(rf"a=fmtp:{m.group(1)}\s+[^\r\n]*?level-id=(\d+)", sdp_in)
+        for c in CODECS["video"]:
+            if c.mimeType.lower() == "video/h265":
+                if lvl:
+                    c.parameters["level-id"] = lvl.group(1)
+                print(f"h265 ofertado pelo cliente (pt={m.group(1)}, level-id={c.parameters.get('level-id')})", flush=True)
+
+    offer_sdp = RTCSessionDescription(sdp=sdp_in, type=data.get("type", "offer"))
     try:
         await pc.setRemoteDescription(offer_sdp)
         answer = await pc.createAnswer()
         await pc.setLocalDescription(answer)
+        for t in pc.getTransceivers():
+            if t.kind == "video" and t._codecs:
+                LAST_CODEC["v"] = t._codecs[0].mimeType
+                print(f"codec negociado: {t._codecs[0].mimeType}", flush=True)
     except Exception as exc:
         print("negociação SDP falhou:", repr(exc), flush=True)
         try:
@@ -1074,6 +1201,9 @@ async def loop_lag():
             LOOP_LAG["max"] = drift
 
 
+LAST_CODEC = {"v": "-"}  # codec do RTC direto (h264/h265) — vai no diag
+
+
 async def diag_stats():
     cap = ChiakiCapture()
     prev_v, prev_t = cap.version, time.perf_counter()
@@ -1081,7 +1211,7 @@ async def diag_stats():
     while True:
         await asyncio.sleep(10)
         now = time.perf_counter()
-        parts = [f"capture={(cap.version - prev_v) / (now - prev_t):.1f}fps"]
+        parts = [f"capture={(cap.version - prev_v) / (now - prev_t):.1f}fps codec={LAST_CODEC['v']}"]
         for tag, st in TRACKS.items():
             pn, pt = prev_n.get(tag, (st["n"], prev_t))
             produced = st["n"] - pn
