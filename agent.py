@@ -36,7 +36,16 @@ from vgamepad import VX360Gamepad, XUSB_BUTTON
 from windows_capture import WindowsCapture
 
 import aiortc.rtcrtpsender as _rtcrtpsender
+import aiortc.rtp as _rtp
 from aiortc.codecs import CODECS
+
+# Chrome oferta codecs em PTs fora do range dinâmico clássico (AV1 em 45/47,
+# H265 em 49). O aiortc só copia o pt remoto no answer quando o pt do offer
+# está em DYNAMIC_PAYLOAD_TYPES — com pt=45/49 o answer saía com o pt LOCAL
+# (105/107), e o browser descartava TODOS os pacotes (PT que ele nunca
+# ofertou → 0 frames decodificados com bytes chegando). PTs estáticos de
+# áudio ficam abaixo de 35 — estender pra 35+ é seguro.
+_rtp.DYNAMIC_PAYLOAD_TYPES = range(35, 128)
 from aiortc.codecs.h264 import H264Encoder, PACKET_MAX
 from aiortc.mediastreams import VIDEO_TIME_BASE, convert_timebase
 
@@ -249,6 +258,25 @@ class HwAV1Encoder(HwH264Encoder):
             if not n:
                 return bytes(out)
 
+    @staticmethod
+    def _leb_size(n: int) -> int:
+        s = 1
+        while n >= 0x80:
+            n >>= 7
+            s += 1
+        return s
+
+    @staticmethod
+    def _is_keyframe(elements) -> bool:
+        # OBU frame header (3) / frame (6): 1o bit do payload é
+        # show_existing_frame; se 0, os 2 bits seguintes são frame_type
+        # (0 = KEY_FRAME). O primeiro OBU de frame decide.
+        for e in elements:
+            if (e[0] & 0x78) in (0x18, 0x30):
+                p = e[1 + ((e[0] >> 2) & 1):]
+                return bool(p) and (p[0] & 0x80) == 0 and (p[0] >> 5) & 3 == 0
+        return False
+
     @classmethod
     def _split_bitstream(cls, data: bytes):
         out = []
@@ -281,29 +309,52 @@ class HwAV1Encoder(HwH264Encoder):
         elements = list(elements)
         if not elements:
             return []
-        out = []
-        first_pkt = True
-        # N = 1o pacote da coded video sequence: frame chave traz seq header
-        # (tipo 1) como 1o OBU — nvenc só emite em keyframe, igual libwebrtc.
-        n_flag = 0x08 if (elements[0][0] & 0x78) == 0x08 else 0
+        # Seq header cacheado e injetado em IDR que chegue sem ele (PLI):
+        # o depacketizer do Chromium marca frame_type=KEY pelo bit N — um
+        # keyframe sem N=1 nunca sai do jitter buffer (tela preta).
+        seq = next((e for e in elements if (e[0] & 0x78) == 0x08), None)
+        if seq is not None:
+            self._seqhdr = seq
+        elif self._is_keyframe(elements) and getattr(self, "_seqhdr", None):
+            elements.insert(0, self._seqhdr)
+            seq = self._seqhdr
+        key = seq is not None and self._is_keyframe(elements)
+
+        # Empacota os OBU elements enchendo cada pacote (formato gortsplib /
+        # packetizer do Chromium): W=0 → cada element/fragmento leva seu
+        # tamanho em LEB128. Vários OBUs por pacote faz o SEQ header sair no
+        # mesmo pacote que o início do frame — essencial: o FindFrames do
+        # Chrome agrupa por Z/Y (is_first=!Z, is_last=!Y), e o frame_type do
+        # 1o pacote (N) vale pro grupo todo.
+        MAXP = PACKET_MAX - 1
+        pkts, cur = [], bytearray()
         for elem in elements:
-            if len(elem) <= PACKET_MAX - 1:
-                # W=1: um OBU element completo, sem campo de tamanho.
-                out.append(bytes([(0x10 | (n_flag if first_pkt else 0))]) + elem)
-            else:
-                # Fragmento: cada pacote leva 1 elemento (W=1), Z/Y marcam
-                # continuação. O elemento fragmentado é só fatia do OBU —
-                # header/ext saem naturalmente no 1o fragmento.
-                off = 0
-                frag_max = PACKET_MAX - 1
-                while off < len(elem):
-                    frag = elem[off:off + frag_max]
-                    off += len(frag)
-                    hdr = 0x10 | (0x80 if off > len(frag) else 0) | (0x40 if off < len(elem) else 0)
-                    if first_pkt:
-                        hdr |= n_flag
-                    out.append(bytes([hdr]) + frag)
-            first_pkt = False
+            pos = 0
+            while pos < len(elem):
+                room = MAXP - len(cur)
+                fraglen = len(elem) - pos
+                while fraglen > 0 and fraglen + self._leb_size(fraglen) > room:
+                    fraglen -= 1
+                if fraglen <= 0:
+                    pkts.append((bytes(cur), False))
+                    cur = bytearray()
+                    continue
+                cur += self._leb128(fraglen) + elem[pos:pos + fraglen]
+                pos += fraglen
+                if pos < len(elem):
+                    pkts.append((bytes(cur), True))
+                    cur = bytearray()
+        if cur:
+            pkts.append((bytes(cur), False))
+
+        out = []
+        for i, (payload, ends_frag) in enumerate(pkts):
+            hdr = 0x40 if ends_frag else 0  # W=0: elements sempre com LEB128
+            if i > 0 and pkts[i - 1][1]:
+                hdr |= 0x80  # Z: começa com continuação do OBU anterior
+            if key and i == 0:
+                hdr |= 0x08  # N: 1o pacote da coded video sequence
+            out.append(bytes([hdr]) + payload)
         return out
 
 
@@ -1050,10 +1101,25 @@ async def offer(request):
                 if lvl:
                     c.parameters["level-id"] = lvl.group(1)
                 print(f"h265 ofertado pelo cliente (pt={m.group(1)}, level-id={c.parameters.get('level-id')})", flush=True)
-    # debug temporário: ordem real dos codecs de vídeo no offer (por que h264
-    # vencia mesmo com h265 presente?)
+    m_av1 = re.search(r"a=rtpmap:(\d+)\s+AV1/90000", sdp_in)
+    if m_av1:
+        fmtp = re.search(rf"a=fmtp:{m_av1.group(1)}\s+([^\r\n]*)", sdp_in)
+        for c in CODECS["video"]:
+            if c.mimeType.lower() == "video/av1" and fmtp:
+                for kv in fmtp.group(1).split(";"):
+                    k, _, v = kv.partition("=")
+                    if k.strip() in ("level-idx", "tier", "profile"):
+                        c.parameters[k.strip()] = v.strip()
+                print(f"av1 ofertado pelo cliente (pt={m_av1.group(1)}, fmtp={fmtp.group(1)})", flush=True)
+    # debug: seção m=video inteira — codecs, fmtp e extmap do offer real.
+    in_video = False
     for line in sdp_in.splitlines():
-        if line.startswith("m=video") or "H265/" in line or "H264/" in line:
+        if line.startswith("m="):
+            in_video = line.startswith("m=video")
+        if in_video and (
+            line.startswith("m=") or line.startswith("a=rtpmap")
+            or line.startswith("a=fmtp") or line.startswith("a=extmap")
+        ):
             print("OFR| " + line.strip(), flush=True)
 
     offer_sdp = RTCSessionDescription(sdp=sdp_in, type=data.get("type", "offer"))
@@ -1061,6 +1127,16 @@ async def offer(request):
         await pc.setRemoteDescription(offer_sdp)
         answer = await pc.createAnswer()
         await pc.setLocalDescription(answer)
+        # debug: o que devolvemos pro cliente (codecs/fmtp/extmap do answer)
+        in_video = False
+        for line in pc.localDescription.sdp.splitlines():
+            if line.startswith("m="):
+                in_video = line.startswith("m=video")
+            if in_video and (
+                line.startswith("m=") or line.startswith("a=rtpmap")
+                or line.startswith("a=fmtp") or line.startswith("a=extmap")
+            ):
+                print("ANS| " + line.strip(), flush=True)
         for t in pc.getTransceivers():
             if t.kind == "video" and t._codecs:
                 LAST_CODEC["v"] = t._codecs[0].mimeType
