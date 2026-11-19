@@ -253,6 +253,48 @@ def find_chiaki_window():
     return wins[0] if wins else (None, None)
 
 
+def window_is_fullscreen(hwnd):
+    """True quando a janela cobre um monitor inteiro (borderless fullscreen).
+    Janela comum/maximizada retorna False — chiaki windowed engasga o pipeline."""
+    user32 = ctypes.windll.user32
+    rect = wt.RECT()
+    if not hwnd or not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+        return False
+
+    class MONITORINFO(ctypes.Structure):
+        _fields_ = [("cbSize", wt.DWORD), ("rcMonitor", wt.RECT),
+                    ("rcWork", wt.RECT), ("dwFlags", wt.DWORD)]
+
+    mi = MONITORINFO()
+    mi.cbSize = ctypes.sizeof(mi)
+    hmon = user32.MonitorFromWindow(hwnd, 2)  # MONITOR_DEFAULTTONEAREST
+    if not user32.GetMonitorInfoW(hmon, ctypes.byref(mi)):
+        return False
+    m = mi.rcMonitor
+    return (rect.left <= m.left and rect.top <= m.top
+            and rect.right >= m.right and rect.bottom >= m.bottom)
+
+
+def _send_f11_posted(hwnd):
+    """F11 via PostMessage mirado no hwnd — nunca atinge outra janela.
+    (keybd_event/SendInput iria pro que tiver foco = janela do usuário.)"""
+    user32 = ctypes.windll.user32
+    user32.PostMessageW(hwnd, 0x0100, 0x7A, 0x00570001)  # WM_KEYDOWN F11
+    user32.PostMessageW(hwnd, 0x0101, 0x7A, 0xC0570001)  # WM_KEYUP
+
+
+def ensure_fullscreen(hwnd):
+    """Garante que a janela do stream esteja em fullscreen. Manda UM F11
+    postado por chamada — dois toggles na mesma chamada podem se cancelar."""
+    if not hwnd or window_is_fullscreen(hwnd):
+        return True
+    if hwnd not in {w for w, _ in find_chiaki_windows()}:
+        return False  # hwnd reutilizado por outra janela — não é mais chiaki
+    _send_f11_posted(hwnd)
+    time.sleep(1.2)
+    return window_is_fullscreen(hwnd)
+
+
 def chiaki_streaming(cap):
     """Stream de verdade = captura viva produzindo frames (launcher parado não conta)."""
     return bool(cap.alive and cap.latest is not None
@@ -356,7 +398,10 @@ class ChiakiCapture:
             if self._wait_fresh(1.5):
                 self._bad.pop(hwnd, None)
                 return True
-            self._bad[hwnd] = time.monotonic() + 300
+            # 12s (não 300): uma janela no meio de transição de fullscreen
+            # fica sem frames por segundos — punição longa matava a captura
+            # e fazia o wake lançar chiaki duplicado.
+            self._bad[hwnd] = time.monotonic() + 12
             self._detach()
         return False
 
@@ -847,7 +892,7 @@ async def wake_routine():
             if launches < 6 and (proc is None or (not stream_running and time.time() - last_launch > 15)):
                 try:
                     proc = subprocess.Popen(
-                        [CHIAKI_EXE, "--exit-app-on-stream-exit",
+                        [CHIAKI_EXE, "--fullscreen", "--exit-app-on-stream-exit",
                          "stream", PS5_NICKNAME, PS5_HOST],
                         cwd=os.path.dirname(CHIAKI_EXE),
                     )
@@ -1053,6 +1098,9 @@ async def diag_stats():
         print("diag " + " ".join(parts), flush=True)
 
 
+_fs_last = {"at": 0.0}  # throttle do re-F11
+
+
 async def publish_supervisor():
     """Stream pública sempre ativa enquanto o chiaki estiver conectado ao PS5.
 
@@ -1061,7 +1109,24 @@ async def publish_supervisor():
     while True:
         await asyncio.sleep(2)
         try:
-            want = await asyncio.to_thread(lambda: bool(find_chiaki_window()[0]))
+            # Chiaki windowed engasga o vídeo no celular — força fullscreen na
+            # janela do stream sempre que ela sair desse estado. O F11 é só
+            # PostMessage no hwnd capturado (pertencente ao chiaki.exe): nunca
+            # atinge janelas de terceiros neste PC de trabalho.
+            cap = ChiakiCapture()
+            if cap.hwnd and not window_is_fullscreen(cap.hwnd) \
+                    and time.time() - _fs_last.get("at", 0) > 10:
+                _fs_last["at"] = time.time()
+                hwnd = cap.hwnd
+                if await asyncio.to_thread(ensure_fullscreen, hwnd):
+                    if hwnd == cap.hwnd:
+                        print(f"chiaki fullscreen reativado hwnd={hwnd}", flush=True)
+            # Sessão WGC morre quando a janela troca de visual (ex.: transição
+            # de fullscreen). ensure re-arbitra e reconecta a captura — sem isso
+            # o stream ficava morto até chegar um /offer.
+            want = bool((await asyncio.to_thread(find_chiaki_window))[0])
+            if want:
+                await asyncio.to_thread(cap.ensure)
             if want and not PUBLISHER._want:
                 await PUBLISHER.start()
             elif not want and PUBLISHER._want:
