@@ -810,8 +810,9 @@ async function connectLive(silent = false) {
     pc.addTransceiver('audio', { direction: 'recvonly' });
     try {
       // HEVC primeiro: Chrome 136+/Safari 18+ oferecem H265 quando há decoder
-      // HW (~86% dos Androids). Se não houver, a lista fica só com H264.
-      const all = RTCRtpSender.getCapabilities('video')?.codecs ?? [];
+      // HW (~86% dos Androids). Receiver caps (não sender): devices com só
+      // decoder HEVC não listam H265 no sender, e o offer sairia H264-only.
+      const all = RTCRtpReceiver.getCapabilities('video')?.codecs ?? [];
       const prefs = [
         ...all.filter(c => c.mimeType.toLowerCase() === 'video/h265'),
         ...all.filter(c => c.mimeType.toLowerCase() === 'video/h264'),
