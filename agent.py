@@ -333,8 +333,11 @@ class HwAV1Encoder(HwH264Encoder):
             while pos < len(elem):
                 room = MAXP - len(cur)
                 fraglen = len(elem) - pos
-                while fraglen > 0 and fraglen + self._leb_size(fraglen) > room:
-                    fraglen -= 1
+                if fraglen + self._leb_size(fraglen) > room:
+                    # maior chunk possível: LEB128 de <2MB tem <=4 bytes
+                    fraglen = max(0, room - 4)
+                    while fraglen > 0 and fraglen + self._leb_size(fraglen) > room:
+                        fraglen -= 1
                 if fraglen <= 0:
                     pkts.append((bytes(cur), False))
                     cur = bytearray()
@@ -680,6 +683,13 @@ class ChiakiWindowTrack(VideoStreamTrack):
         self._t0 = None
         self._next = 0.0
 
+    @staticmethod
+    def _to_vframe(img, res):
+        vf = av.VideoFrame.from_ndarray(img, format="bgra")
+        if res and (vf.width, vf.height) != res:
+            vf = vf.reformat(width=res[0], height=res[1])
+        return vf
+
     async def recv(self):
         if self._start is None:
             self._start = time.perf_counter()
@@ -702,10 +712,11 @@ class ChiakiWindowTrack(VideoStreamTrack):
             # janela ainda não capturada: frame preto
             self._frame = np.zeros((2, 2, 3), dtype=np.uint8)
             self._frame_stamp = time.perf_counter()
-        vf = av.VideoFrame.from_ndarray(self._frame, format="bgra")
         res = self._res or effective_res()
-        if res and (vf.width, vf.height) != res:
-            vf = vf.reformat(width=res[0], height=res[1])
+        # from_ndarray+reformat em 1080p custa ~10ms — síncrono no event loop
+        # isso derrubava o loop inteiro com 2+ senders vivos (looplag>400ms,
+        # REMB despencava). Vai pra thread como o grab.
+        vf = await asyncio.to_thread(self._to_vframe, self._frame, res)
         # pts = instante real da captura. Com pts por índice, qualquer atraso
         # de produção acumulava como latência de stream ("lentidão" com stats
         # boas); agora um frame atrasado pula pra posição de tempo correta.
