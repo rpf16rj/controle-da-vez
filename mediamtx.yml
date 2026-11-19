@@ -1,0 +1,23 @@
+logLevel: info
+logDestinations: [stdout]
+
+# WebRTC: the agent publishes via WHIP, spectators read via WHEP (Node proxies it).
+webrtc: yes
+webrtcAddress: :8889
+# Pin ICE to the LAN IP: with a wildcard, host-mode would announce docker0
+# (172.x) candidates — clients that pick an unreachable pair get their session
+# killed by STUN/consent timeout.
+webrtcLocalUDPAddress: <MTX_LAN_IP>:8189
+webrtcLocalTCPAddress: <MTX_LAN_IP>:8189
+# Host IP as an extra candidate — container NAT hides its real IP.
+webrtcAdditionalHosts: [<MTX_LAN_IP>]
+webrtcICEServers2:
+  - url: turn:<MTX_LAN_IP>:3478?transport=udp
+    username: <TURN_USER>
+    password: <TURN_PASSWORD>
+
+paths:
+  ps5:
+    # Only the agent (gaming PC) may publish; reads only internal/LAN (WHEP via proxy).
+    publishIPs: [<AGENT_HOST_LAN_IP>/32, 127.0.0.1/32]
+    readIPs: [127.0.0.1/32, 192.168.0.0/16, 172.16.0.0/12, 10.0.0.0/8]

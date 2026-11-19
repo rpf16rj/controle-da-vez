@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="pt-BR">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#111315"><title>Admin — Controle da Vez</title><link rel="stylesheet" href="/style.css?v=auth"><script src="/admin.js?v=auth" defer></script></head>
+<body class="admin-page">
+<header class="topbar"><a class="brand" href="/" aria-label="Controle da Vez, início"><span class="brand-icon">✚</span> CONTROLE<span>DA VEZ</span></a><nav aria-label="Admin"><a href="/">← Voltar à sala</a></nav></header>
+<main class="admin-main">
+<section class="admin-card">
+  <p class="eyebrow">PAINEL DO ADMIN</p>
+  <h1>Cadastros da sala</h1>
+  <p class="muted">Bloqueie, remova ou defina senhas de quem entra na sala.</p>
+  <div id="admin-status" class="muted">Carregando…</div>
+  <div id="online-now" class="muted"></div>
+  <table class="admin-table" id="users-table" hidden>
+    <thead><tr><th>Nome</th><th>Usuário</th><th>Status</th><th>Pagou</th><th></th></tr></thead>
+    <tbody id="users-body"></tbody>
+  </table>
+</section>
+<section class="admin-card" id="admin-login" hidden>
+  <p class="eyebrow">ACESSO RESTRITO</p>
+  <h1>Entre como admin</h1>
+  <form id="admin-login-form" method="post" action="#">
+    <label for="admin-user">Usuário</label><input id="admin-user" autocomplete="username" required>
+    <label for="admin-pass">Senha</label><input id="admin-pass" type="password" autocomplete="current-password" required>
+    <button class="primary" type="submit">Entrar ↗</button>
+  </form>
+</section>
+</main>
+<dialog id="pw-dialog"><div class="dialog-heading"><p class="eyebrow">DEFINIR SENHA</p><button type="button" class="close" data-close="pw-dialog" aria-label="Fechar">×</button></div><h2 id="pw-title">Nova senha</h2><div id="pw-form"><label for="pw-input">Senha (vazio = gerar aleatória)</label><input id="pw-input" maxlength="128" autocomplete="off" placeholder="Deixe vazio para gerar"><button class="primary" id="pw-save">Salvar senha</button></div><div id="pw-result" hidden><p class="muted">Senha definida — aparece só agora. As sessões do usuário foram encerradas.</p><div class="cred-box"><div><span>Senha</span><strong id="pw-new"></strong></div></div><button class="outline" id="pw-copy">Copiar senha</button></div></dialog>
+<div id="toast" role="status" aria-live="polite" hidden></div>
+</body></html>

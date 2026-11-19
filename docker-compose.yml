@@ -1,0 +1,24 @@
+services:
+  controle-da-vez:
+    build: .
+    container_name: controle-da-vez
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # Replace <TURN_HOST>/<TURN_USER>/<TURN_PASSWORD> with your TURN server.
+      ICE_SERVERS: '[{"urls":["stun:stun.l.google.com:19302","turn:<TURN_HOST>:3478?transport=udp","turn:<TURN_HOST>:3478?transport=tcp"],"username":"<TURN_USER>","credential":"<TURN_PASSWORD>"}]'
+      # MediaMTX WHEP endpoint reachable by this container.
+      MTX_URL: 'http://<MTX_HOST>:8889'
+      # Non-obvious admin URL — pick your own random path.
+      ADMIN_PATH: '/admin-secret-change-me'
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./data:/data
+  mediamtx:
+    image: bluenviron/mediamtx:1.18.2-ffmpeg
+    container_name: mtx-ps5
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./mediamtx.yml:/mediamtx.yml:ro
