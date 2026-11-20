@@ -31,13 +31,13 @@ from aiortc import (
     RTCRtpSender,
     RTCRtpCodecParameters,
 )
-from aiortc.rtcrtpparameters import RTCRtcpFeedback
+from aiortc.rtcrtpparameters import RTCRtcpFeedback, RTCRtpHeaderExtensionParameters
 from vgamepad import VX360Gamepad, XUSB_BUTTON
 from windows_capture import WindowsCapture
 
 import aiortc.rtcrtpsender as _rtcrtpsender
 import aiortc.rtp as _rtp
-from aiortc.codecs import CODECS
+from aiortc.codecs import CODECS, HEADER_EXTENSIONS
 
 # Chrome oferta codecs em PTs fora do range dinâmico clássico (AV1 em 45/47,
 # H265 em 49). O aiortc só copia o pt remoto no answer quando o pt do offer
@@ -69,11 +69,9 @@ PS5_REGISTKEY = os.environ.get("PS5_REGISTKEY", "<PS5_REGISTKEY>")
 CHIAKI_EXE = os.environ.get("CHIAKI_EXE", r"C:\chiaki-ng-Win\chiaki.exe")
 
 FPS = 30
-# Jogador direto: alvo 20 Mbps (rede dedicada aguenta — pedido do operador).
-# O congestion control ainda pode baixar se a estimativa despencar, mas o
-# teto/ponto de partida é 20M.
+# Jogador direto: alvo inicial 20 Mbps até o congestion control estimar.
+# O teto efetivo vem do cliente (rtc-params, até 100M) ou do REMB.
 VIDEO_BITRATE = 20_000_000
-VIDEO_BITRATE_MAX = 20_000_000
 # Cap FIXO do relay público (720p30 pra espectadores). O perfil de
 # qualidade do jogador era aplicado globalmente: "lite" derrubava a live
 # pública junto e "auto" deixava subir até 10M na LAN pro mediamtx.
@@ -83,6 +81,42 @@ RELAY_BITRATE_CAP = 3_000_000
 VIDEO_PROFILES = {"smooth": 4_000_000, "auto": None, "detail": 8_000_000, "data": 2_500_000, "lite": 1_800_000}
 VIDEO_RES = {"lite": (1280, 720)}
 _active_profile = {"name": "auto"}
+
+# Preferências por sessão do jogador ({type:'rtc-params'} no datachannel):
+# fps 30/60, teto de bitrate e perfil de latência estilo Sunshine.
+RTC_FPS_CHOICES = (30, 60)
+RTC_BITRATE_MIN = 1_000_000
+RTC_BITRATE_CEIL = 100_000_000  # "até 100mb é ótimo" — teto duro da negociação
+# playout = (min,max) do RTP header extension playout-delay, em 10ms —
+# clampa o jitter buffer do receiver. Gaming = {0,0} (spec webrtc); o piso
+# real que sobra é o interno do Chrome (jitter+decode estimado), não zero.
+# smooth = faixa plena {0,4095}: desfaz um clamp anterior sem desligar a ext.
+LATENCY_PROFILES = {
+    "ultra": {"playout": (0, 0)},
+    "balanced": {"playout": (0, 6)},
+    "smooth": {"playout": (0, 4095)},
+}
+RTC_STATE = {"fps": 60, "cap": None, "profile": "balanced"}
+
+
+def apply_rtc_params(track, data):
+    """Preferências por-conexão: só o sender do jogador, nunca o relay."""
+    fps = data.get("fps")
+    if fps in RTC_FPS_CHOICES:
+        track._rtc_fps = fps
+    br = data.get("bitrate")
+    if br in (None, "auto"):
+        track._rtc_cap = None
+    elif isinstance(br, (int, float)) and RTC_BITRATE_MIN <= br <= RTC_BITRATE_CEIL:
+        track._rtc_cap = int(br)
+    prof = str(data.get("lat", ""))
+    if prof in LATENCY_PROFILES:
+        track._rtc_profile = prof
+        RTC_PLAYOUT["delay"] = LATENCY_PROFILES[prof]["playout"]
+        RTC_STATE["profile"] = prof
+    RTC_STATE["fps"] = getattr(track, "_rtc_fps", None) or 60
+    RTC_STATE["cap"] = getattr(track, "_rtc_cap", None)
+    print(f"rtc-params: fps={RTC_STATE['fps']} cap={RTC_STATE['cap']} lat={RTC_STATE['profile']}", flush=True)
 
 
 def set_video_profile(name):
@@ -111,10 +145,16 @@ class HwH264Encoder(H264Encoder):
 
     CODEC_NAME = "h264_nvenc"
 
+    def _rtc_fps(self):
+        return getattr(self, "_fps_pref", None) or 60
+
     def _encode_frame(self, frame, force_keyframe):
+        fps = self._rtc_fps()
         if self.codec and (
             frame.width != self.codec.width
             or frame.height != self.codec.height
+            or self.codec.framerate != Fraction(fps, 1)
+            or getattr(self, "_codec_profile", None) != getattr(self, "_rtc_profile", None)
             or abs(self.target_bitrate - self.codec.bit_rate) / self.codec.bit_rate > 0.1
         ):
             self.buffer_data = b""
@@ -132,26 +172,34 @@ class HwH264Encoder(H264Encoder):
             self.codec.height = frame.height
             self.codec.bit_rate = self.target_bitrate
             self.codec.pix_fmt = "yuv420p"
-            # Declarado 60fps (taxa do track do jogador). O track 30fps do
-            # relay gera pts 0,2,4… nessa base — monotônico, sem problema.
-            # Declarar 30 com input real de 60 faria o CBR do nvenc errar o
+            # framerate = fps negociado do jogador (default 60, taxa do track).
+            # O track 30fps do relay não manda _rtc_fps: segue 60 declarado —
+            # declarar 30 com input real de 60 faria o CBR do nvenc errar o
             # orçamento de bits por frame (2× por frame).
-            self.codec.framerate = Fraction(60, 1)
-            self.codec.time_base = Fraction(1, 60)
+            self.codec.framerate = Fraction(fps, 1)
+            self.codec.time_base = Fraction(1, fps)
+            self._codec_profile = getattr(self, "_rtc_profile", None)
             self.codec.options = {
                 "delay": "0",
                 "preset": "p1",
                 "tune": "ull",
+                "zerolatency": "1",
+                "rc-lookahead": "0",
                 "rc": "cbr",
                 # B-frames reordenam ~2 frames no encoder+decoder (~66-100ms de
                 # latência embutida) — zerado, o delay de vidro cai.
                 "bf": "0",
                 "spatial_aq": "0",
                 "temporal_aq": "0",
-                # Keyframe a cada 2s: viewer WHEP novo não espera o GOP default
-                # do nvenc (~8s) pra decodificar — era a "tela preta" da live.
-                "g": str(FPS * 2),
+                # Keyframe a cada 2s do fps negociado: viewer novo não espera
+                # o GOP default do nvenc (~8s) pra decodificar.
+                "g": str(fps * 2),
             }
+            if self._codec_profile == "ultra":
+                # VBV de 1 frame (modelo do Sunshine): bitrate plano por
+                # frame → sem rajadas → jitter menor → buffer do receiver
+                # pode ficar no piso. Custa qualidade em cenas complexas.
+                self.codec.options["bufsize"] = str(max(1, self.target_bitrate // fps))
 
         data_to_send = b""
         _t0 = time.perf_counter()
@@ -168,13 +216,20 @@ class HwH264Encoder(H264Encoder):
         relay_cap = getattr(self, "_relay_cap", None)
         if relay_cap is not None:
             return min(self.__target_bitrate, relay_cap)
-        return effective_bitrate(self.__target_bitrate)
+        player_cap = getattr(self, "_player_cap", None)
+        effective = effective_bitrate(self.__target_bitrate)
+        # Teto negociado pelo cliente (rtc-params): limita, nunca levanta —
+        # acima dele ainda manda a estimativa de congestão (REMB).
+        return min(effective, player_cap) if player_cap is not None else effective
 
     @target_bitrate.setter
     def target_bitrate(self, bitrate):
         # Piso 1.2M: a estimativa do receiver pode despencar num soluço
         # momentâneo (ex.: screenshot no celular) — 500k deixava 1080p ilegível.
-        new = max(1_200_000, min(bitrate, VIDEO_BITRATE_MAX))
+        # O teto do REMB é o cap negociado pelo cliente (rtc-params); sem ele,
+        # segue a congestão até o teto duro de 100M ("não economizar banda").
+        ceiling = getattr(self, "_player_cap", None) or RTC_BITRATE_CEIL
+        new = max(1_200_000, min(bitrate, ceiling))
         prev = getattr(self, "_last_tb", None)
         if prev is None or abs(new - prev) > 200_000:
             print(f"encoder bitrate: estimativa {bitrate/1e6:.2f}M -> alvo {new/1e6:.2f}M", flush=True)
@@ -397,6 +452,50 @@ CODECS["video"] += [
     ),
 ]
 
+# playout-delay (http://www.webrtc.org/experiments/rtp-hdrext/playout-delay):
+# o sender escreve (min,max) em unidades de 10ms nos pacotes de vídeo e o
+# Chrome clampa o jitter buffer entre eles — o maior componente do atraso de
+# vídeo. aiortc não conhece a extensão: (1) registro local → entra no answer
+# por find_common_header_extensions com o id do offer (Chrome usa 5);
+# (2) wrappers em configure/set emitem o valor de 3 bytes (min<<12|max).
+PLAYOUT_DELAY_URI = "http://www.webrtc.org/experiments/rtp-hdrext/playout-delay"
+RTC_PLAYOUT = {"delay": LATENCY_PROFILES[RTC_STATE["profile"]]["playout"]}
+HEADER_EXTENSIONS["video"].append(
+    RTCRtpHeaderExtensionParameters(id=4, uri=PLAYOUT_DELAY_URI)
+)
+
+_orig_hex_configure = _rtp.HeaderExtensionsMap.configure
+
+
+def _hex_configure(self, parameters):
+    _orig_hex_configure(self, parameters)
+    for ext in parameters.headerExtensions:
+        if ext.uri == PLAYOUT_DELAY_URI:
+            self._HeaderExtensionsMap__ids.playout_delay = ext.id
+
+
+_rtp.HeaderExtensionsMap.configure = _hex_configure
+
+_orig_hex_set = _rtp.HeaderExtensionsMap.set
+
+
+def _hex_set(self, values):
+    profile, blob = _orig_hex_set(self, values)
+    pd = getattr(values, "playout_delay", None) or RTC_PLAYOUT["delay"]
+    pd_id = getattr(self._HeaderExtensionsMap__ids, "playout_delay", None)
+    # _playout_ok marca só o sender do jogador (tag em offer()): se o mediamtx
+    # negociar a extensão no WHIP, o relay público não herda o clamp do
+    # jogador — espectador não é sensível a latência e {0,0} lhe daria drops.
+    if pd is None or not pd_id or not getattr(self, "_playout_ok", False):
+        return profile, blob
+    exts = _rtp.unpack_header_extensions(profile, blob) if profile and blob else []
+    packed = ((int(pd[0]) & 0xFFF) << 12) | (int(pd[1]) & 0xFFF)
+    exts.append((pd_id, packed.to_bytes(3, "big")))
+    return _rtp.pack_header_extensions(exts)
+
+
+_rtp.HeaderExtensionsMap.set = _hex_set
+
 
 _orig_get_encoder = _rtcrtpsender.get_encoder
 
@@ -417,17 +516,26 @@ _rtcrtpsender.get_encoder = _patched_get_encoder
 
 # Encoders nascem lazy dentro de _next_encoded_frame, sem contexto de qual
 # sender/track os criou. Embrulho o método: na primeira passada de cada
-# encoder, marco _relay_cap quando a track do sender é a do relay (v720p).
+# encoder, marco _relay_cap quando a track do sender é a do relay (v720p);
+# no track do jogador sincronizo por frame as preferências de rtc-params
+# (fps/teto/perfil mudam a qualquer momento via datachannel).
 _orig_next_encoded = _rtcrtpsender.RTCRtpSender._next_encoded_frame
 
 
 async def _next_encoded_frame(self, codec):
     out = await _orig_next_encoded(self, codec)
     enc = getattr(self, "_RTCRtpSender__encoder", None)
-    if enc is not None and getattr(enc, "_cap_checked", None) is None:
-        enc._cap_checked = True
-        if getattr(getattr(self, "track", None), "_tag", None) == "v720p":
+    if enc is None:
+        return out
+    track = getattr(self, "track", None)
+    if getattr(track, "_res", None) is not None or getattr(track, "_tag", None) == "v720p":
+        if getattr(enc, "_cap_checked", None) is None:
+            enc._cap_checked = True
             enc._relay_cap = RELAY_BITRATE_CAP
+    elif track is not None:
+        enc._player_cap = getattr(track, "_rtc_cap", None)
+        enc._fps_pref = getattr(track, "_rtc_fps", None)
+        enc._rtc_profile = getattr(track, "_rtc_profile", None)
     return out
 
 
@@ -675,6 +783,10 @@ class ChiakiWindowTrack(VideoStreamTrack):
         self._tag = tag
         TRACKS[tag] = {"n": 0}
         self._res = res  # resolução fixa (espectadores); None = perfil global
+        # Preferências negociadas pelo jogador (rtc-params); None = default.
+        self._rtc_fps = None
+        self._rtc_cap = None
+        self._rtc_profile = None
         self._count = 0
         self._start = None
         self._last_version = -1
@@ -720,12 +832,13 @@ class ChiakiWindowTrack(VideoStreamTrack):
         # pts = instante real da captura. Com pts por índice, qualquer atraso
         # de produção acumulava como latência de stream ("lentidão" com stats
         # boas); agora um frame atrasado pula pra posição de tempo correta.
+        fps = self._rtc_fps or self._fps
         if self._t0 is None:
             self._t0 = self._frame_stamp
-        pts = max(self._count, int((self._frame_stamp - self._t0) * self._fps + 0.5))
+        pts = max(self._count, int((self._frame_stamp - self._t0) * fps + 0.5))
         self._count = pts + 1
         vf.pts = pts
-        vf.time_base = Fraction(1, self._fps)
+        vf.time_base = Fraction(1, fps)
         TRACKS[self._tag]["n"] += 1
         # Pacing desacoplado do pts: avança 1/fps por envio mas nunca vai pro
         # futuro — se o pts pulou por um gap de captura, não transforma isso
@@ -733,7 +846,7 @@ class ChiakiWindowTrack(VideoStreamTrack):
         now = time.perf_counter()
         if not self._next:
             self._next = now
-        self._next += 1.0 / self._fps
+        self._next += 1.0 / fps
         wait = self._next - now
         if wait < -0.1:
             self._next = now  # muito atrasado: realinha em vez de disparar rajada
@@ -973,6 +1086,11 @@ async def offer(request):
     PLAYER_PCS.add(pc)
     relay = InputRelay()
     ACTIVE_RELAYS.add(relay)
+    # Referência fixa pro datachannel aplicar rtc-params neste track.
+    vtrack = ChiakiWindowTrack(fps=60)
+    # Sessão nova começa no perfil padrão — não herda o clamp da anterior.
+    RTC_PLAYOUT["delay"] = LATENCY_PROFILES["balanced"]["playout"]
+    RTC_STATE.update({"fps": 60, "cap": None, "profile": "balanced"})
 
     async def cleanup(_=None):
         PLAYER_PCS.discard(pc)
@@ -1010,6 +1128,11 @@ async def offer(request):
             # Preferência de qualidade não exige grant (só afeta este peer)
             if data.get("type") == "video-pref":
                 set_video_profile(str(data.get("p", "")))
+                return
+            # Preferências de sessão do jogador (fps/teto/perfil de latência)
+            # — idem: aplicadas só ao track deste pc.
+            if data.get("type") == "rtc-params":
+                apply_rtc_params(vtrack, data)
                 return
             token = data.get("t")
             if not grant_allows(token):
@@ -1079,8 +1202,14 @@ async def offer(request):
 
     pc.on("datachannel", on_datachannel)
     # 60fps pro jogador: a captura nativa entrega ~55fps do PS5 — mandar só
-    # 30 jogava metade fora e dobrava o staleness do frame exibido.
-    pc.addTrack(ChiakiWindowTrack(fps=60))
+    # 30 jogava metade fora e dobrava o staleness do frame exibido. O cliente
+    # pode renegociar 30/60 via rtc-params no datachannel.
+    pc.addTrack(vtrack)
+    for _s in pc.getSenders():
+        # Habilita a emissão de playout-delay só no sender do jogador.
+        _m = getattr(_s, "_RTCRtpSender__rtp_header_extensions_map", None)
+        if _m is not None:
+            _m._playout_ok = True
     audio_track = None
     if capture.pid and "m=audio" in data.get("sdp", ""):
         try:
@@ -1407,6 +1536,8 @@ async def diag_stats():
         await asyncio.sleep(10)
         now = time.perf_counter()
         parts = [f"capture={(cap.version - prev_v) / (now - prev_t):.1f}fps codec={LAST_CODEC['v']}"]
+        cap_m = f"{RTC_STATE['cap'] / 1e6:.0f}M" if RTC_STATE["cap"] else "auto"
+        parts.append(f"rtc={RTC_STATE['fps']}fps/{cap_m}/{RTC_STATE['profile']}")
         for tag, st in TRACKS.items():
             pn, pt = prev_n.get(tag, (st["n"], prev_t))
             produced = st["n"] - pn

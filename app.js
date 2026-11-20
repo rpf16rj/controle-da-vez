@@ -482,6 +482,14 @@ const MODES = { foot: 'Pé', driving: 'Dirigindo', menu: 'Menu' };
 let controlMode = localStorage.getItem('cdv-mode') || 'foot';
 let qualityPref = localStorage.getItem('cdv-quality') || 'auto';
 let codecPref = localStorage.getItem('cdv-codec') || 'auto';
+let fpsPref = localStorage.getItem('cdv-fps') || '60';
+let ratePref = localStorage.getItem('cdv-rate') || 'auto';
+let latPref = localStorage.getItem('cdv-lat') || 'balanced';
+// Perfil de latência (estilo Sunshine): alvo inicial e piso do jitter buffer.
+// 'ultra' aponta pro mínimo que o Chrome aceita; 'smooth' mantém colchão pra
+// rede ruim. O agente acompanha com o playout-delay do RTP (clamp do buffer).
+const LAT_JITTER = { ultra: { jit: 10, floor: 0 }, balanced: { jit: 40, floor: 15 }, smooth: { jit: 100, floor: 100 } };
+const latJit = () => LAT_JITTER[latPref] || LAT_JITTER.balanced;
 // Auto-degrade: framesDropped crescendo = o aparelho não sustenta o perfil
 // (decode 1080p60 no celular, estouro de pacotes no Wi-Fi). Desce um degrau
 // do perfil a cada ~3s de drops até 'lite' — sem trocar a escolha do usuário.
@@ -532,6 +540,27 @@ $('#codec-sel').addEventListener('change', e => {
   codecPref = e.target.value;
   localStorage.setItem('cdv-codec', codecPref);
   if (pc) { disconnectLive(); connectLive(true); }
+});
+// fps/teto de bitrate/perfil de latência: negociados por datachannel
+// (rtc-params), aplicados na hora pelo agente sem reconectar.
+$('#fps-sel').addEventListener('change', e => {
+  fpsPref = e.target.value;
+  localStorage.setItem('cdv-fps', fpsPref);
+  sendRtcParams();
+});
+$('#rate-sel').addEventListener('change', e => {
+  ratePref = e.target.value;
+  localStorage.setItem('cdv-rate', ratePref);
+  sendRtcParams();
+});
+$('#lat-sel').addEventListener('change', e => {
+  latPref = e.target.value;
+  localStorage.setItem('cdv-lat', latPref);
+  jitTarget = latJit().jit;
+  jitCalm = 0;
+  setJitTarget(jitTarget);
+  sendRtcParams();
+  toast(`Perfil de latência: ${$('#lat-sel option:checked')?.textContent}.`);
 });
 
 // Mouse look: deltas acumulam no analógico direito e decaem rápido ao parar.
@@ -762,6 +791,19 @@ function sendVideoPref(p) {
     try { inputChannel.send(JSON.stringify({ type: 'video-pref', p })); } catch {}
   }
 }
+function sendRtcParams() {
+  if (inputChannel?.readyState === 'open') {
+    try {
+      inputChannel.send(JSON.stringify({
+        type: 'rtc-params',
+        fps: parseInt(fpsPref, 10) || 60,
+        bitrate: ratePref === 'auto' ? 'auto' : parseInt(ratePref, 10) * 1000000,
+        lat: latPref,
+      }));
+      clientLog('rtc-params', { fps: fpsPref, rate: ratePref, lat: latPref });
+    } catch {}
+  }
+}
 function sendNeutral() {
   if (inputChannel?.readyState === 'open') {
     try { inputChannel.send(JSON.stringify({ ...NEUTRAL, t: state?.current?.controlToken })); } catch {}
@@ -785,7 +827,7 @@ async function connectLive(silent = false) {
       // alvo zero transformava pico de decode em frame pulado) e o loop de
       // stats desce adaptativo enquanto não houver drops (menos vidro).
       videoReceiver = e.receiver;
-      jitTarget = 40;
+      jitTarget = latJit().jit;
       setJitTarget(jitTarget);
       video.muted = false;
       video.srcObject = e.streams[0];
@@ -795,7 +837,7 @@ async function connectLive(silent = false) {
       updateLiveUi();
     };
     inputChannel = pc.createDataChannel('input', { ordered: false, maxRetransmits: 0 });
-    inputChannel.onopen = () => { degrade.applied = null; degrade.count = 0; sendVideoPref(qualityPref); };
+    inputChannel.onopen = () => { degrade.applied = null; degrade.count = 0; sendVideoPref(qualityPref); sendRtcParams(); };
     inputChannel.onmessage = e => {
       try {
         const m = JSON.parse(e.data);
@@ -1103,6 +1145,9 @@ function updateLiveUi() {
   $('#mode-btn').textContent = `Modo: ${MODES[controlMode]}`;
   $('#quality-sel').value = qualityPref;
   $('#codec-sel').value = codecPref;
+  $('#fps-sel').value = fpsPref;
+  $('#rate-sel').value = ratePref;
+  $('#lat-sel').value = latPref;
   $('#stats-hud').hidden = !on;
 }
 function maybeAutoConnect() {
@@ -1240,13 +1285,13 @@ async function updateStats() {
         m.push(['est', `${(pair.availableIncomingBitrate / 1e6).toFixed(1)}M`]);
       }
       const dropDelta = (video.framesDropped ?? 0) - (lastStatsSample?.framesDropped ?? video.framesDropped ?? 0);
-      // Jitter buffer adaptativo: ~8 amostras limpas → desce 10ms (piso 15ms,
-      // ~1 frame a 60fps). Drop voltou → sobe pra 40ms na hora.
+      // Jitter buffer adaptativo: ~8 amostras limpas → desce 10ms até o piso
+      // do perfil de latência. Drop voltou → sobe pro alvo inicial na hora.
       if (dropDelta >= 2) {
-        if (jitTarget !== 40) { jitTarget = 40; setJitTarget(jitTarget); }
+        if (jitTarget !== latJit().jit) { jitTarget = latJit().jit; setJitTarget(jitTarget); }
         jitCalm = 0;
-      } else if (++jitCalm >= 8 && jitTarget > 15) {
-        jitTarget = Math.max(15, jitTarget - 10);
+      } else if (++jitCalm >= 8 && jitTarget > latJit().floor) {
+        jitTarget = Math.max(latJit().floor, jitTarget - 10);
         setJitTarget(jitTarget);
         jitCalm = 0;
       }
@@ -1283,6 +1328,9 @@ function stopStatsLoop() {
 // Restaura preferências de UI.
 $('#mode-btn').textContent = `Modo: ${MODES[controlMode]}`;
 $('#quality-sel').value = qualityPref;
+$('#fps-sel').value = fpsPref;
+$('#rate-sel').value = ratePref;
+$('#lat-sel').value = latPref;
 $('#mouse-look-btn').classList.toggle('on', mouseLook);
 updateLiveUi();
 refresh();
