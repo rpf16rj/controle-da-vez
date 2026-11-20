@@ -17,6 +17,34 @@ const HOST = process.env.HOST || '127.0.0.1';
 const PORT = Number(process.env.PORT || 3000);
 const ALLOWED_HOSTS = (process.env.ALLOWED_HOSTS || '127.0.0.1:3000,localhost:3000').split(',');
 const ICE_SERVERS = JSON.parse(process.env.ICE_SERVERS || '[]');
+// WAN ativa: wan-watch.sh (cron no host) grava data/net.json com o IP público
+// de saída e mantém o --external-ip do coturn igual. Aqui o host dos
+// turn:/turns: do ICE_SERVERS é trocado por esse IP — failover de WAN ou IP
+// dinâmico não deixam mais o TURN apontando pra endereço morto.
+const NET_FILE = join(DATA_DIR, 'net.json');
+let netCache = { at: 0, net: null };
+function hostNet() {
+  if (Date.now() - netCache.at < 10_000) return netCache.net;
+  let net = null;
+  try {
+    const raw = JSON.parse(readFileSync(NET_FILE, 'utf8'));
+    const age = Math.round((Date.now() - Date.parse(raw.checkedAt)) / 1000);
+    net = { ip: raw.ip || null, checkedAt: raw.checkedAt, since: raw.since, ageSec: age, stale: !(age < 300), error: raw.error || undefined };
+  } catch {}
+  netCache = { at: Date.now(), net };
+  return net;
+}
+function iceServers() {
+  const net = hostNet();
+  let list = ICE_SERVERS;
+  if (net?.ip && !net.stale) {
+    list = ICE_SERVERS.map(s => ({
+      ...s,
+      urls: [].concat(s.urls).map(u => u.replace(/^(turns?:)[^:?]+/, `$1${net.ip}`)),
+    }));
+  }
+  return list.length ? list : undefined;
+}
 const SPECTATOR_URL = process.env.SPECTATOR_URL || process.env.YOUTUBE_URL || '';
 const YT_CHANNEL = (process.env.YT_CHANNEL || 'https://www.youtube.com/@CHANGE_ME').replace(/\/$/, '');
 let ytCache = { at: 0, url: null };
@@ -151,7 +179,8 @@ function clientPayload(uid, sid) {
     hostOnline: agentOnlineCache.online,
     hostStreaming: agentOnlineCache.streaming,
     hostWaking: agentOnlineCache.waking,
-    iceServers: ICE_SERVERS.length ? ICE_SERVERS : undefined,
+    iceServers: iceServers(),
+    hostNet: hostNet() || undefined,
     spectatorUrl: ytCache.url || SPECTATOR_URL || undefined,
     // RTC off (modo local) → todo mundo vê o YouTube, nunca o relay do PS5.
     spectatorMode: rtcEnabled && agentOnlineCache.publishing ? 'relay' : 'youtube',
@@ -285,7 +314,8 @@ const server = http.createServer(async (req, res) => {
       const agent = await agentOnline();
       return json(res, 200, {
         ...room.snapshot(uid), hostOnline: agent.online, hostStreaming: agent.streaming, hostWaking: agent.waking,
-        iceServers: ICE_SERVERS.length ? ICE_SERVERS : undefined,
+        iceServers: iceServers(),
+        hostNet: hostNet() || undefined,
         spectatorUrl: ytCache.url || SPECTATOR_URL || undefined,
         spectatorMode: rtcEnabled && agent.publishing ? 'relay' : 'youtube',
         rtcEnabled,

@@ -165,7 +165,8 @@ function render() {
     $('#screen-status').textContent = label;
     $('#screen-status').className = cls;
   }
-  if (!specStopped) $('#screen-load').textContent = isWaking() ? 'Acordando o PS5 — pode levar ~1 min…' : 'Conectando…';
+  // Não sobrescreve a mensagem de erro/tentativa da live (specLoadMsg).
+  if (!specStopped) $('#screen-load').textContent = isWaking() ? 'Acordando o PS5 — pode levar ~1 min…' : (specLoadMsg || 'Conectando…');
   timer();
   renderChat();
   updateScreenMode();
@@ -177,6 +178,7 @@ let chatReadAt = Date.now(); // não-lidas contam só mensagens novas desta sess
 let prevApproved = null; // transição false→true = aprovado agora → toast
 let videoReceiver = null;
 let jitTarget = 40;
+const avProbe = { n: 0 };
 let jitCalm = 0; // amostras seguidas sem drop — desce o buffer adaptativo
 function setJitTarget(ms) {
   try { if (videoReceiver) videoReceiver.jitterBufferTarget = ms; } catch {}
@@ -459,7 +461,7 @@ setInterval(() => {
 }, 5000);
 
 // ---- Live: chiaki-ng -> WebRTC -> controle virtual ----
-let pc = null, inputChannel = null, inputTimer = null, connectBusy = false;
+let pc = null, inputChannel = null, inputTimer = null, connectBusy = false, liveStream = null;
 let seq = 0;
 const pendingAcks = new Map(); // seq -> timestamp de envio (performance.now)
 let inputRtt = null, inputProc = null;
@@ -482,14 +484,17 @@ const MODES = { foot: 'Pé', driving: 'Dirigindo', menu: 'Menu' };
 let controlMode = localStorage.getItem('cdv-mode') || 'foot';
 let qualityPref = localStorage.getItem('cdv-quality') || 'auto';
 let codecPref = localStorage.getItem('cdv-codec') || 'auto';
-let fpsPref = localStorage.getItem('cdv-fps') || '60';
+// Padrão: 30fps + latência mínima (o agente nasce no mesmo perfil).
+let fpsPref = localStorage.getItem('cdv-fps') || '30';
 let ratePref = localStorage.getItem('cdv-rate') || 'auto';
-let latPref = localStorage.getItem('cdv-lat') || 'balanced';
+let latPref = localStorage.getItem('cdv-lat') || 'ultra';
+// L/R invertido (celular em landscape invertido com o GameSir): troca no agente.
+let swapPref = localStorage.getItem('cdv-swap') === '1';
 // Perfil de latência (estilo Sunshine): alvo inicial e piso do jitter buffer.
 // 'ultra' aponta pro mínimo que o Chrome aceita; 'smooth' mantém colchão pra
 // rede ruim. O agente acompanha com o playout-delay do RTP (clamp do buffer).
 const LAT_JITTER = { ultra: { jit: 10, floor: 0 }, balanced: { jit: 40, floor: 15 }, smooth: { jit: 100, floor: 100 } };
-const latJit = () => LAT_JITTER[latPref] || LAT_JITTER.balanced;
+const latJit = () => LAT_JITTER[latPref] || LAT_JITTER.ultra;
 // Auto-degrade: framesDropped crescendo = o aparelho não sustenta o perfil
 // (decode 1080p60 no celular, estouro de pacotes no Wi-Fi). Desce um degrau
 // do perfil a cada ~3s de drops até 'lite' — sem trocar a escolha do usuário.
@@ -524,6 +529,21 @@ function cycleMode() {
   toast(`Controles em modo ${MODES[controlMode]}.`);
 }
 $('#mode-btn').addEventListener('click', cycleMode);
+$('#swap-btn').classList.toggle('on', swapPref);
+$('#vib-btn').addEventListener('click', () => {
+  // Teste isolado da vibração do aparelho (sem rumble do jogo no meio).
+  let ret;
+  try { ret = navigator.vibrate ? navigator.vibrate(500) : 'sem-api'; } catch (err) { ret = String(err).slice(0, 60); }
+  clientLog('vibrate-test', { ret: String(ret), active: navigator.userActivation?.hasBeenActive ?? null });
+  toast(ret === true ? 'Vibração pedida (500ms). Sentiu?' : `Vibração indisponível: ${ret}`);
+});
+$('#swap-btn').addEventListener('click', () => {
+  swapPref = !swapPref;
+  localStorage.setItem('cdv-swap', swapPref ? '1' : '0');
+  $('#swap-btn').classList.toggle('on', swapPref);
+  sendRtcParams();
+  toast(swapPref ? 'Áudio: esquerda/direita invertidos.' : 'Áudio: esquerda/direita normais.');
+});
 $('#mouse-look-btn').addEventListener('click', () => {
   mouseLook = !mouseLook;
   $('#mouse-look-btn').classList.toggle('on', mouseLook);
@@ -754,25 +774,43 @@ const NEUTRAL = { lx: 0, ly: 0, rx: 0, ry: 0, lt: 0, rt: 0, buttons: [] };
 function frameActive(f) {
   return Math.abs(f.lx) + Math.abs(f.ly) + Math.abs(f.rx) + Math.abs(f.ry) + f.lt + f.rt + f.buttons.length > 0;
 }
+// Input amostrado a 250Hz (era 60Hz = +8ms médio por comando) e enviado só
+// quando o estado muda, com keepalive a cada 50ms (o agente usa o fluxo
+// para manter o controle e o RTT do HUD).
+const INPUT_TICK_MS = 4;
+const INPUT_KEEPALIVE_MS = 50;
+let lastSentKey = '', lastSentAt = 0, lastDecayAt = 0;
 function inputLoop() {
   const mine = state?.current?.mine;
   if (inputChannel?.readyState !== 'open') return;
-  // Decaimento do mouse look quando o mouse para.
-  if (performance.now() - mouse.lastMove > 90) { mouse.rx *= 0.6; mouse.ry *= 0.6; if (Math.abs(mouse.rx) < 0.02) mouse.rx = 0; if (Math.abs(mouse.ry) < 0.02) mouse.ry = 0; }
+  const now = performance.now();
+  // Decaimento do mouse look quando o mouse para — em passos de ~16ms, para
+  // não depender da frequência do loop.
+  if (now - mouse.lastMove > 90 && now - lastDecayAt >= 16) {
+    lastDecayAt = now;
+    mouse.rx *= 0.6; mouse.ry *= 0.6;
+    if (Math.abs(mouse.rx) < 0.02) mouse.rx = 0;
+    if (Math.abs(mouse.ry) < 0.02) mouse.ry = 0;
+  }
   if (!mine) {
     if (sentActiveFlag) {
       sentActiveFlag = false;
+      lastSentKey = '';
       try { inputChannel.send(JSON.stringify({ t: state?.current?.controlToken, s: ++seq, ...NEUTRAL })); } catch {}
     }
     return;
   }
   const frame = currentInput();
+  const key = JSON.stringify(frame);
+  if (key === lastSentKey && now - lastSentAt < INPUT_KEEPALIVE_MS) return;
   // Canal saturado: descarta o frame novo — os antigos já na fila valem menos
   // que o próximo ciclo; empilhar só aumenta o atraso do input.
   if (inputChannel.bufferedAmount > 131072) return;
   try {
     inputChannel.send(JSON.stringify({ t: state.current.controlToken, s: ++seq, ...frame }));
-    pendingAcks.set(seq, performance.now());
+    lastSentKey = key;
+    lastSentAt = now;
+    pendingAcks.set(seq, now);
     if (pendingAcks.size > 300) pendingAcks.delete(pendingAcks.keys().next().value);
   } catch {}
   sentActiveFlag = frameActive(frame) || sentActiveFlag;
@@ -780,12 +818,69 @@ function inputLoop() {
 let sentActiveFlag = false;
 function startInputLoop() {
   stopInputLoop();
-  inputTimer = setInterval(inputLoop, 1000 / 60);
+  lastSentKey = '';
+  inputTimer = setInterval(inputLoop, INPUT_TICK_MS);
 }
 function stopInputLoop() {
   if (inputTimer) clearInterval(inputTimer);
   inputTimer = null;
 }
+// Rumble vindo do jogo (chiaki → X360 virtual → agente). O agente repete o
+// estado a cada 150ms enquanto vibra; cada efeito dura 300ms, então uma
+// mensagem perdida não deixa o controle vibrando preso.
+// Pads cujo motor não responde (ex.: controle de encaixe sem motor, ou
+// Android que expõe vibrationActuator mas devolve 'not-supported').
+const rumbleDead = new Set();
+let rumbleLogged = false;
+function applyRumble(strong, weak) {
+  const on = strong > 0.01 || weak > 0.01;
+  let padRumble = false;
+  const pads = [...(navigator.getGamepads?.() ?? [])].filter(Boolean);
+  for (const p of pads) {
+    const act = p.vibrationActuator;
+    if (!act || rumbleDead.has(p.id)) continue;
+    padRumble = true;
+    try {
+      const r = on
+        ? act.playEffect('dual-rumble', { startDelay: 0, duration: 300, strongMagnitude: Math.min(1, strong), weakMagnitude: Math.min(1, weak) })
+        : act.reset?.();
+      r?.then?.(res => {
+        if (res === 'not-supported') rumbleDead.add(p.id);
+        if (!rumbleLogged && on) { rumbleLogged = true; clientLog('rumble', { pad: p.id.slice(0, 60), res }); }
+      }, err => {
+        rumbleDead.add(p.id);
+        if (!rumbleLogged) { rumbleLogged = true; clientLog('rumble', { pad: p.id.slice(0, 60), err: String(err).slice(0, 80) }); }
+      });
+    } catch (err) { rumbleDead.add(p.id); }
+  }
+  if (!rumbleLogged && on && !padRumble) {
+    rumbleLogged = true;
+    clientLog('rumble', { pad: pads.map(p => p.id.slice(0, 40)).join('|') || 'nenhum', act: 'sem-motor', vibrate: !!navigator.vibrate });
+  }
+  // Fallback: sem motor no gamepad (ou no touch), vibra o próprio celular —
+  // num controle de encaixe (GameSir etc.) a vibração chega na mão. Pulso
+  // contínuo de 200ms renovado pelo agente a cada 150ms (o PWM com pulsos
+  // de 12–50ms não era sentido em alguns aparelhos). Sem controle de força.
+  if (!padRumble && navigator.vibrate) {
+    const mag = Math.min(1, Math.max(strong, weak));
+    const want = on && mag > 0.1;
+    let ret;
+    try {
+      if (want) ret = navigator.vibrate(200);
+      else if (phoneBuzzing) ret = navigator.vibrate(0);
+    } catch (err) { ret = String(err).slice(0, 60); }
+    phoneBuzzing = want;
+    rumbleProbe.n++;
+    rumbleProbe.max = Math.max(rumbleProbe.max, mag);
+    if (ret === false) rumbleProbe.blocked++;
+    if (!rumbleProbe.sent && rumbleProbe.n >= 40) {
+      rumbleProbe.sent = true;
+      clientLog('rumble-vibrate', { n: rumbleProbe.n, max: +rumbleProbe.max.toFixed(2), blocked: rumbleProbe.blocked, active: navigator.userActivation?.hasBeenActive ?? null, ret: String(ret) });
+    }
+  }
+}
+let phoneBuzzing = false;
+const rumbleProbe = { n: 0, max: 0, blocked: 0, sent: false };
 function sendVideoPref(p) {
   if (inputChannel?.readyState === 'open') {
     try { inputChannel.send(JSON.stringify({ type: 'video-pref', p })); } catch {}
@@ -796,9 +891,10 @@ function sendRtcParams() {
     try {
       inputChannel.send(JSON.stringify({
         type: 'rtc-params',
-        fps: parseInt(fpsPref, 10) || 60,
+        fps: parseInt(fpsPref, 10) || 30,
         bitrate: ratePref === 'auto' ? 'auto' : parseInt(ratePref, 10) * 1000000,
         lat: latPref,
+        swap: swapPref,
       }));
       clientLog('rtc-params', { fps: fpsPref, rate: ratePref, lat: latPref });
     } catch {}
@@ -814,23 +910,214 @@ function clientLog(evt, extra = {}) {
     navigator.sendBeacon('/api/client-log', new Blob([JSON.stringify({ evt, ua: navigator.userAgent.slice(0, 150), ...extra })], { type: 'application/json' }));
   } catch {}
 }
+// Opus estéreo: sem stereo=1 no fmtp o libwebrtc do browser decodifica o
+// Opus em MONO (default do AudioDecoderOpus), mesmo o agente mandando
+// estéreo — o áudio do PS5 (downmix estéreo do Remote Play) chegava sem
+// espacialização. Aplicado no offer local e no answer remoto.
+// Perfil ⚡ Mínima: tira o áudio do grupo de lip-sync do vídeo. Com o mesmo
+// msid o browser segura o áudio para alinhar com o caminho do vídeo
+// (decode/render) — medido ~70–100ms de NetEq com jitter de rede de 9ms.
+// Separado, cada um toca no seu mínimo.
+function splitAvSync(sdp) {
+  if (!sdp) return sdp;
+  return sdp.replace(/(m=audio[\s\S]*?)(?=\r?\nm=|$)/, sec => sec.replace(/^a=msid:(\S+) /m, 'a=msid:$1-aud '));
+}
+function opusStereo(sdp) {
+  if (!sdp) return sdp;
+  const pt = /a=rtpmap:(\d+) opus\/48000\/2/i.exec(sdp)?.[1];
+  if (!pt) return sdp;
+  const fmtp = new RegExp(`^a=fmtp:${pt} ([^\r\n]*)`, 'm');
+  const m = fmtp.exec(sdp);
+  if (!m) {
+    return sdp.replace(new RegExp(`(a=rtpmap:${pt} opus/48000/2\r?\n)`, 'i'), `$1a=fmtp:${pt} stereo=1;sprop-stereo=1\r\n`);
+  }
+  let params = m[1].trim();
+  if (!/(^|;)\s*stereo=/.test(params)) params += ';stereo=1';
+  if (!/(^|;)\s*sprop-stereo=/.test(params)) params += ';sprop-stereo=1';
+  return sdp.replace(fmtp, `a=fmtp:${pt} ${params}`);
+}
+// ---- Conexão do jogador: diagnóstico + resiliência ----
+// Antes: 1 tentativa por turno; se o ICE falhava a tela ficava em
+// "Conectando…" pra sempre, sem motivo. Agora cada etapa é cronometrada e
+// mostrada (#conn-diag), falhas viram nova tentativa com backoff (a 2ª só
+// por relay TURN quando o TURN respondeu) e o resultado vai pro client-log.
+const conn = { attempt: 0, relayOnly: false, t0: 0, marks: {}, cand: { host: 0, srflx: 0, relay: 0, prflx: 0 }, ice: '', pair: '', fail: null, visible: false, retryTimer: null, retryAt: 0, iceTimer: null, tick: null };
+const CONN_RETRY_MS = [1500, 4000, 8000, 15000];
+const CONN_MAX_ATTEMPTS = 5;
+const CONN_ICE_TIMEOUT_MS = 12000;
+function connReset() {
+  conn.t0 = performance.now(); conn.marks = {}; conn.cand = { host: 0, srflx: 0, relay: 0, prflx: 0 };
+  conn.ice = ''; conn.pair = ''; conn.fail = null; conn.visible = true;
+}
+function connMark(k) {
+  if (conn.marks[k] == null) conn.marks[k] = Math.round(performance.now() - conn.t0);
+  renderConnDiag();
+}
+function hasTurn() {
+  return (state?.iceServers || []).some(s => [].concat(s.urls).some(u => /^turns?:/.test(u)));
+}
+// Coleta de candidatos sem esperar o gathering completo: STUN/TURN lento ou
+// morto segurava até o timeout (4s). Com TURN configurado sai assim que houver
+// um relay (é o caminho que funciona de fora), ou srflx + 1.2s; sem TURN, srflx + 300ms.
+function gatherFast(peer, onCand) {
+  return new Promise(resolve => {
+    const t0 = performance.now(), seen = { host: 0, srflx: 0, relay: 0 };
+    const turn = hasTurn();
+    let done = false;
+    const finish = () => { if (!done) { done = true; clearInterval(poll); clearTimeout(cap); resolve(); } };
+    const check = () => {
+      if (peer.iceGatheringState === 'complete') return finish();
+      const el = performance.now() - t0;
+      if (seen.relay && el > 80) return finish();
+      // Relay de fora costuma chegar <300ms depois do srflx; na LAN do host
+      // ele nunca chega (sem NAT loopback) — não segura 2.5s à toa.
+      if (seen.srflx && el > (turn ? 1200 : 300)) return finish();
+    };
+    peer.addEventListener('icecandidate', e => {
+      const t = e.candidate?.type;
+      if (t) { seen[t] = (seen[t] || 0) + 1; onCand?.(t); }
+      check();
+    });
+    peer.addEventListener('icegatheringstatechange', check);
+    const poll = setInterval(check, 40);
+    const cap = setTimeout(finish, 2500);
+    check();
+  });
+}
+function connHint() {
+  const f = conn.fail || '';
+  if (!f) return '';
+  if (f.startsWith('http:')) return f.slice(5);
+  const c = conn.cand;
+  if (!c.srflx && !c.relay) return 'Seu navegador não conseguiu sair por UDP nem falar com o TURN — firewall, VPN ou rede corporativa bloqueando WebRTC.';
+  if (hasTurn() && !c.relay) return 'O servidor TURN não respondeu — porta 3478 fechada no roteador do host, ou sua rede bloqueia TURN.';
+  if (state?.hostNet?.stale) return 'O host não confirma o IP público há alguns minutos (link de internet instável?).';
+  return 'O TURN respondeu, mas o caminho até o PC do jogo falhou.';
+}
+const CONN_FAIL_LABEL = { 'ice-timeout': 'sem caminho de rede (tempo esgotado)', 'ice-failed': 'caminho de rede falhou', 'conn-failed': 'conexão caiu' };
+function renderConnDiag() {
+  const el = $('#conn-diag');
+  if (!el) return;
+  const show = Boolean(state?.current?.mine && conn.visible);
+  el.hidden = !show;
+  if (!show) { clearInterval(conn.tick); conn.tick = null; return; }
+  if (!conn.tick && (conn.retryTimer || (!conn.marks.frame && !conn.fail))) conn.tick = setInterval(renderConnDiag, 500);
+  const m = conn.marks, c = conn.cand, failed = Boolean(conn.fail);
+  const st = (ok, wait) => ok ? 'ok' : (failed && !wait ? 'bad' : 'wait');
+  const li = (cls, label, detail) => `<li class="${cls}"><b>${label}</b><span>${detail}</span></li>`;
+  const cands = `host ${c.host} · srflx ${c.srflx} · relay ${c.relay}`;
+  const rows = [
+    li(state?.hostStreaming ? 'ok' : 'bad', 'PS5 / agente', state?.hostStreaming ? 'online' : 'offline'),
+    li(st(m.gather != null), 'Candidatos de rede', m.gather != null ? `${m.gather}ms · ${cands}` : cands),
+    li(st(m.answer != null), 'Negociação com o host', m.answer != null ? `${m.answer}ms` : 'aguardando'),
+    li(st(m.ice != null), 'Caminho de rede (ICE)', m.ice != null ? `${m.ice}ms · ${conn.pair || conn.ice}` : (conn.ice || 'aguardando')),
+    li(st(m.frame != null), 'Primeiro quadro', m.frame != null ? `${m.frame}ms` : 'aguardando'),
+  ];
+  let head = `Conectando ao PS5 — tentativa ${Math.max(1, conn.attempt)}${conn.relayOnly ? ' (só relay)' : ''}`;
+  if (m.frame != null) head = `Conectado em ${m.frame}ms${conn.pair ? ` · ${conn.pair}` : ''}`;
+  let foot = '';
+  if (failed) {
+    head = `Falhou: ${CONN_FAIL_LABEL[conn.fail] || 'erro ao conectar'}`;
+    const wait = Math.max(0, Math.ceil((conn.retryAt - Date.now()) / 1000));
+    foot = `<p class="hint">${connHint()}</p>` + (conn.retryTimer
+      ? `<p class="retry">Nova tentativa em ${wait}s…</p>`
+      : `<button type="button" id="conn-retry">Tentar de novo</button>`);
+  }
+  const net = state?.hostNet;
+  const netLine = net ? `<p class="net">IP público do host: ${net.ip || '?'}${net.stale ? ' (desatualizado)' : ''}</p>` : '';
+  el.innerHTML = `<p class="head">${head}</p><ul>${rows.join('')}</ul>${foot}${netLine}`;
+  $('#conn-retry')?.addEventListener('click', () => { conn.attempt = 0; conn.relayOnly = false; connectLive(false); });
+}
+function connFail(reason) {
+  if (conn.fail) return;
+  conn.fail = reason;
+  clientLog('rtc-timing', { ok: false, reason: String(reason).slice(0, 120), attempt: conn.attempt, relayOnly: conn.relayOnly, ...conn.marks, cand: conn.cand, ice: conn.ice });
+  disconnectLive();
+  if (state?.current?.mine && conn.attempt < CONN_MAX_ATTEMPTS) {
+    // 2ª tentativa só por relay quando o TURN respondeu: descarta pares
+    // host/srflx que o ICE pode estar insistindo sem saída.
+    conn.relayOnly = conn.attempt === 1 && conn.cand.relay > 0;
+    const wait = CONN_RETRY_MS[Math.min(conn.attempt - 1, CONN_RETRY_MS.length - 1)];
+    conn.retryAt = Date.now() + wait;
+    conn.retryTimer = setTimeout(() => {
+      conn.retryTimer = null;
+      if (state?.current?.mine && !pc && !connectBusy) connectLive(true);
+      else renderConnDiag();
+    }, wait);
+  }
+  renderConnDiag();
+}
+async function connPairType(peer) {
+  try {
+    const rep = await peer.getStats();
+    let pair = null; const cands = new Map();
+    rep.forEach(r => {
+      if (r.type === 'local-candidate' || r.type === 'remote-candidate') cands.set(r.id, r);
+      if (r.type === 'candidate-pair' && r.nominated && r.state === 'succeeded') pair = r;
+    });
+    if (!pair) return '';
+    const l = cands.get(pair.localCandidateId), r = cands.get(pair.remoteCandidateId);
+    return `${l?.candidateType || '?'}→${r?.candidateType || '?'}${l?.protocol ? ' ' + l.protocol : ''}`;
+  } catch { return ''; }
+}
 async function connectLive(silent = false) {
   if (state?.rtcEnabled === false) { if (!silent) toast('RTC desligado pelo admin.'); return; }
   if (!state?.hostStreaming) { wakeHost(Boolean(state?.current?.mine)); if (!silent) toast('Acordando o PS5…'); return; }
   if (!state?.user) { openNick(); return; }
   if (connectBusy || pc) return;
   connectBusy = true;
+  if (conn.retryTimer) { clearTimeout(conn.retryTimer); conn.retryTimer = null; }
+  conn.attempt++;
+  connReset();
+  renderConnDiag();
   try {
-    pc = new RTCPeerConnection(state?.iceServers?.length ? { iceServers: state.iceServers } : undefined);
+    pc = new RTCPeerConnection({
+      ...(state?.iceServers?.length ? { iceServers: state.iceServers } : {}),
+      iceTransportPolicy: conn.relayOnly ? 'relay' : 'all',
+    });
+    const thisPc = pc;
+    pc.oniceconnectionstatechange = () => {
+      if (pc !== thisPc) return;
+      conn.ice = thisPc.iceConnectionState;
+      if ((conn.ice === 'connected' || conn.ice === 'completed') && conn.marks.ice == null) {
+        clearTimeout(conn.iceTimer);
+        connMark('ice');
+        connPairType(thisPc).then(t => { conn.pair = t; renderConnDiag(); });
+      } else if (conn.ice === 'failed') connFail('ice-failed');
+      renderConnDiag();
+    };
     pc.ontrack = e => {
       // Folga do decoder: começa em 40ms (a 60fps cada frame tem ~17ms —
       // alvo zero transformava pico de decode em frame pulado) e o loop de
       // stats desce adaptativo enquanto não houver drops (menos vidro).
+      // ontrack dispara para vídeo E áudio: antes o receiver do áudio (que
+      // chega por último) sobrescrevia videoReceiver — o alvo de buffer do
+      // perfil ia pro áudio (ultra 10ms / equilibrada 40ms a mais) e o do
+      // vídeo nunca era aplicado.
+      // Áudio e vídeo podem vir em streams diferentes (splitAvSync): junta
+      // os dois num MediaStream só para o <video>.
+      if (!liveStream) liveStream = new MediaStream();
+      liveStream.addTrack(e.track);
+      if (e.track.kind !== 'video') {
+        // ⚡ Mínima: pede o piso do NetEq também no áudio (default do browser
+        // é null = ele decide; aud medido ~70ms com jitter de 3ms).
+        if (latPref === 'ultra') { try { e.receiver.jitterBufferTarget = 0; } catch {} }
+        return;
+      }
       videoReceiver = e.receiver;
+      const onFirstFrame = () => {
+        if (!pc || conn.marks.frame != null) return;
+        connMark('frame');
+        clientLog('rtc-timing', { ok: true, attempt: conn.attempt, relayOnly: conn.relayOnly, ...conn.marks, cand: conn.cand, pair: conn.pair });
+        conn.attempt = 0; conn.relayOnly = false;
+        setTimeout(() => { if (conn.marks.frame != null && !conn.fail) { conn.visible = false; renderConnDiag(); } }, 3000);
+      };
+      if (video.requestVideoFrameCallback) video.requestVideoFrameCallback(onFirstFrame);
+      else video.addEventListener('loadeddata', onFirstFrame, { once: true });
       jitTarget = latJit().jit;
       setJitTarget(jitTarget);
       video.muted = false;
-      video.srcObject = e.streams[0];
+      video.srcObject = liveStream;
       video.hidden = false;
       $('#screen-placeholder').hidden = true;
       $('#screen-status').textContent = 'AO VIVO';
@@ -841,6 +1128,7 @@ async function connectLive(silent = false) {
     inputChannel.onmessage = e => {
       try {
         const m = JSON.parse(e.data);
+        if (m.type === 'rumble') { applyRumble(+m.l || 0, +m.s || 0); return; }
         if (m.type === 'input-ack') {
           const sent = pendingAcks.get(m.s);
           if (sent != null) {
@@ -852,7 +1140,8 @@ async function connectLive(silent = false) {
       } catch {}
     };
     pc.onconnectionstatechange = () => {
-      if (['failed', 'closed'].includes(pc?.connectionState)) { clientLog('rtc-state', { cs: pc.connectionState, ice: pc.iceConnectionState }); disconnectLive('Conexão com o host encerrada.'); }
+      if (pc?.connectionState === 'failed') { clientLog('rtc-state', { cs: pc.connectionState, ice: pc.iceConnectionState }); connFail(conn.marks.frame != null ? 'conn-failed' : 'ice-failed'); }
+      else if (pc?.connectionState === 'closed') { clientLog('rtc-state', { cs: pc.connectionState, ice: pc.iceConnectionState }); disconnectLive('Conexão com o host encerrada.'); }
       else if (pc?.connectionState === 'connected') clientLog('rtc-connected', { ice: pc.iceConnectionState });
     };
     const transceiver = pc.addTransceiver('video', { direction: 'recvonly' });
@@ -904,13 +1193,11 @@ async function connectLive(silent = false) {
         .replace(/(m=video [\s\S]*?)(a=candidate:)/m, (s, sec, cand) => sec + extra + cand);
       clientLog('h265-inject', { ok: /H265\/90000/.test(offer.sdp) });
     }
+    offer.sdp = opusStereo(offer.sdp);
+    const gathering = gatherFast(pc, t => { conn.cand[t] = (conn.cand[t] || 0) + 1; renderConnDiag(); });
     await pc.setLocalDescription(offer);
-    await new Promise(resolve => {
-      if (pc.iceGatheringState === 'complete') return resolve();
-      const done = () => { if (pc.iceGatheringState === 'complete') resolve(); };
-      pc.addEventListener('icegatheringstatechange', done);
-      setTimeout(resolve, 4000);
-    });
+    await gathering;
+    connMark('gather');
     clientLog('rtc-offer-start', { rtc: typeof RTCPeerConnection, pads: navigator.getGamepads ? [...navigator.getGamepads()].filter(Boolean).map(p => p.id.slice(0, 40)) : 'no-api' });
     const res = await fetch('/api/offer', {
       method: 'POST',
@@ -919,8 +1206,13 @@ async function connectLive(silent = false) {
     });
     const ans = await readJson(res);
     if (!res.ok) throw new Error(ans.error || 'Falha ao contatar o agente.');
+    connMark('answer');
+    ans.sdp = opusStereo(ans.sdp);
+    if (latPref === 'ultra') ans.sdp = splitAvSync(ans.sdp);
     await pc.setRemoteDescription(ans);
+    conn.iceTimer = setTimeout(() => { if (pc === thisPc && conn.marks.ice == null) connFail('ice-timeout'); }, CONN_ICE_TIMEOUT_MS);
     negotiatedCodec = sdpVideoCodec(ans.sdp);
+    avProbe.n = 0;
     startInputLoop();
     startStatsLoop();
     if (!silent) toast('Live conectada. Entre na fila, confirme seu turno e controle com gamepad, WASD ou touch.');
@@ -928,20 +1220,24 @@ async function connectLive(silent = false) {
     console.error('[connectLive]', error);
     clientLog('rtc-fail', { err: String(error?.message || error).slice(0, 200) });
     if (!silent) toast(String(error?.message || 'Não foi possível conectar à live.').slice(0, 200));
-    disconnectLive();
+    connectBusy = false;
+    connFail('http:' + String(error?.message || 'Não foi possível conectar.').slice(0, 160));
   } finally {
     connectBusy = false;
     updateLiveUi();
   }
 }
 function disconnectLive(message) {
+  if (conn.retryTimer) { clearTimeout(conn.retryTimer); conn.retryTimer = null; }
+  clearTimeout(conn.iceTimer);
+  if (!conn.fail) conn.visible = false;
   stopInputLoop();
   stopStatsLoop();
   sendNeutral();
   if (inputChannel) { try { inputChannel.close(); } catch {} }
   if (pc) pc.close();
   pc = null; inputChannel = null; sentActiveFlag = false; inputRtt = inputProc = null; negotiatedCodec = null;
-  video.pause(); video.srcObject = null; video.hidden = true;
+  video.pause(); video.srcObject = null; video.hidden = true; liveStream = null;
   $('#screen-placeholder').hidden = false;
   const [label, cls] = hostPill();
   $('#screen-status').textContent = label;
@@ -971,6 +1267,7 @@ function toEmbedUrl(url) {
   } catch { return null; }
 }
 // ---- Espectador: stream única do servidor via MediaMTX (WHEP) ----
+let specLoadMsg = '';
 let specPc = null, specBusy = false, specFails = 0, lastSpecKey = null, specStopped = false, ytWatching = false;
 async function connectSpectator() {
   if (specPc || specBusy) return;
@@ -979,6 +1276,32 @@ async function connectSpectator() {
     const spc = new RTCPeerConnection(state?.iceServers?.length ? { iceServers: state.iceServers } : undefined);
     specPc = spc;
     $('#unwatch-btn').hidden = false;
+    const specT0 = performance.now();
+    specLoadMsg = specFails ? `Conectando à live — tentativa ${specFails + 1}…` : 'Conectando à live…';
+    $('#screen-load').textContent = specLoadMsg;
+    // Sem isso, ICE falho deixava a live "carregando" pra sempre (sem
+    // estado de erro, sem nova tentativa). Falha → motivo na tela, log e
+    // nova tentativa com backoff (até 3); depois, botão de tentar de novo.
+    const specFail = why => {
+      if (specPc !== spc) return;
+      const c = spc._cand || {};
+      clientLog('spec-fail', { why, ice: spc.iceConnectionState, cand: c, ms: Math.round(performance.now() - specT0) });
+      specFails++;
+      disconnectSpectator();
+      const hint = !c.srflx && !c.relay ? 'seu navegador não sai por UDP/TURN (firewall/VPN?)'
+        : hasTurn() && !c.relay ? 'o TURN do host não respondeu' : 'caminho de rede até o servidor falhou';
+      specLoadMsg = `Live sem conexão: ${hint}.` + (specFails < 3 ? ' Tentando de novo…' : '');
+      $('#screen-load').textContent = specLoadMsg;
+      if (specFails < 3) setTimeout(updateScreenMode, 2000 * specFails);
+      else $('#watch-btn').hidden = false;
+    };
+    const specIceTimer = setTimeout(() => {
+      if (specPc === spc && !['connected', 'completed'].includes(spc.iceConnectionState)) specFail('ice-timeout');
+    }, CONN_ICE_TIMEOUT_MS);
+    spc.oniceconnectionstatechange = () => {
+      if (['connected', 'completed'].includes(spc.iceConnectionState)) { clearTimeout(specIceTimer); specLoadMsg = ''; }
+      else if (spc.iceConnectionState === 'failed') { clearTimeout(specIceTimer); specFail('ice-failed'); }
+    };
     spc.addTransceiver('video', { direction: 'recvonly' });
     spc.addTransceiver('audio', { direction: 'recvonly' });
     // WHEP pode mandar áudio e vídeo em MediaStreams separados — juntar os
@@ -1000,17 +1323,17 @@ async function connectSpectator() {
       });
     };
     const offer = await spc.createOffer();
+    offer.sdp = opusStereo(offer.sdp);
+    const specCand = { host: 0, srflx: 0, relay: 0 };
+    const gathering = gatherFast(spc, t => { specCand[t] = (specCand[t] || 0) + 1; });
     await spc.setLocalDescription(offer);
-    await new Promise(res => {
-      if (spc.iceGatheringState === 'complete') return res();
-      const t = setTimeout(res, 4000);
-      spc.addEventListener('icegatheringstatechange', () => { if (spc.iceGatheringState === 'complete') { clearTimeout(t); res(); } });
-    });
+    await gathering;
+    spc._cand = specCand;
     const res = await fetch('/api/whep', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sdp: spc.localDescription.sdp }) });
     const data = await readJson(res);
     if (!res.ok) throw new Error(data?.error || `whep HTTP ${res.status}`);
     if (!specPc) return;
-    await spc.setRemoteDescription({ type: 'answer', sdp: data.sdp });
+    await spc.setRemoteDescription({ type: 'answer', sdp: opusStereo(data.sdp) });
     specFails = 0;
     clientLog('spec-connect', {});
   } catch (e) {
@@ -1132,6 +1455,7 @@ function updateScreenMode() {
 }
 const isCoarse = matchMedia('(pointer: coarse)').matches;
 function updateLiveUi() {
+  renderConnDiag();
   const on = Boolean(pc);
   $('#live-bar').hidden = !on;
   $('#zen-btn').hidden = !on;
@@ -1212,11 +1536,12 @@ async function updateStats() {
   if (!pc) return;
   try {
     const report = await pc.getStats();
-    let video = null, pair = null, localCand = null, remoteCand = null;
+    let video = null, audio = null, pair = null, localCand = null, remoteCand = null;
     const candidates = new Map(), codecMap = new Map();
     report.forEach(r => { if (r.type === 'local-candidate' || r.type === 'remote-candidate') candidates.set(r.id, r); });
     report.forEach(r => {
       if (r.type === 'inbound-rtp' && r.kind === 'video' && !video) video = r;
+      else if (r.type === 'inbound-rtp' && r.kind === 'audio' && !audio) audio = r;
       else if (r.type === 'candidate-pair' && r.state === 'succeeded' && r.nominated && !pair) pair = r;
       else if (r.type === 'codec') codecMap.set(r.id, r);
     });
@@ -1251,9 +1576,21 @@ async function updateStats() {
     if (inputRtt != null) m.push(['input', `${inputRtt.toFixed(0)}ms`]);
     if (inputProc != null) m.push(['proc', `${inputProc.toFixed(1)}ms`]);
     if (video) {
-      const jitterMs = (video.jitterBufferDelay != null && video.jitterBufferTarget != null && video.jitterBufferTarget > 0)
-        ? (video.jitterBufferDelay / video.jitterBufferTarget) * 1000 : null;
+      // Atraso médio do jitter buffer no último intervalo: jitterBufferDelay
+      // (s, acumulado) / jitterBufferEmittedCount (frames). Antes lia
+      // 'jitterBufferTarget', que não existe no stat — buf nunca aparecia e
+      // o catch-up abaixo nunca disparava.
+      const dEmit = (video.jitterBufferEmittedCount ?? 0) - (lastStatsSample?.jitterBufferEmittedCount ?? 0);
+      const dDelay = (video.jitterBufferDelay ?? 0) - (lastStatsSample?.jitterBufferDelay ?? 0);
+      const jitterMs = (video.jitterBufferDelay != null && lastStatsSample?.jitterBufferEmittedCount != null && dEmit > 0)
+        ? (dDelay / dEmit) * 1000 : null;
       if (jitterMs != null) m.push(['buf', `${jitterMs.toFixed(0)}ms`]);
+      // Buffer do áudio (NetEq) no intervalo — compara com 'buf' do vídeo
+      // para ver o descompasso áudio×imagem do lado do browser.
+      if (audio?.jitterBufferDelay != null && lastStatsSample?.aEmit != null) {
+        const dE = (audio.jitterBufferEmittedCount ?? 0) - lastStatsSample.aEmit;
+        if (dE > 0) m.push(['aud', `${((audio.jitterBufferDelay - lastStatsSample.aDelay) / dE * 1000).toFixed(0)}ms`]);
+      }
       else if (video.jitter != null) m.push(['jit', `${(video.jitter * 1000).toFixed(0)}ms`]);
       if (video.packetsLost != null && video.packetsReceived > 0) {
         const loss = video.packetsLost / (video.packetsLost + video.packetsReceived) * 100;
@@ -1307,7 +1644,21 @@ async function updateStats() {
         }
         degrade.count = 0;
       }
-      lastStatsSample = { framesDecoded: video.framesDecoded, framesDropped: video.framesDropped, bytesReceived: video.bytesReceived, timestamp: video.timestamp };
+      // Sonda A/V (1× por sessão, ~30s após conectar): separa jitter de rede
+      // (audio.jitter) de buffer do NetEq e perda/ocultação de áudio.
+      if (++avProbe.n === 30 && audio) {
+        const a = audio, jb = a.jitterBufferEmittedCount ? a.jitterBufferDelay / a.jitterBufferEmittedCount * 1000 : null;
+        clientLog('av-probe', {
+          aud: jb != null ? Math.round(jb) : null,
+          ajit: a.jitter != null ? Math.round(a.jitter * 1000) : null,
+          conceal: a.totalSamplesReceived ? +(a.concealedSamples / a.totalSamplesReceived * 100).toFixed(2) : null,
+          aloss: a.packetsLost ?? null,
+          vjit: video.jitter != null ? Math.round(video.jitter * 1000) : null,
+          rtt: pair?.currentRoundTripTime != null ? Math.round(pair.currentRoundTripTime * 1000) : null,
+          via: [localCand?.candidateType, remoteCand?.candidateType, localCand?.networkType].filter(Boolean).join('/'),
+        });
+      }
+      lastStatsSample = { framesDecoded: video.framesDecoded, framesDropped: video.framesDropped, bytesReceived: video.bytesReceived, timestamp: video.timestamp, jitterBufferDelay: video.jitterBufferDelay, jitterBufferEmittedCount: video.jitterBufferEmittedCount, aDelay: audio?.jitterBufferDelay, aEmit: audio?.jitterBufferEmittedCount };
     }
     const pairType = [localCand?.candidateType, remoteCand?.candidateType].filter(Boolean).join('→');
     if (pairType) m.push(['via', pairType]);

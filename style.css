@@ -407,3 +407,19 @@ body{display:flex;flex-direction:column;min-height:100dvh}
 #bell-menu li:last-child{border-bottom:0}
 .bell-ok{padding:7px 14px;border-radius:8px;background:var(--lime);color:#151810;font-size:11px;font-weight:800}
 .bell-ok:hover{filter:brightness(1.08)}
+
+/* Diagnóstico da conexão do jogador (etapas, tempos, motivo da falha) */
+#conn-diag{position:absolute;left:12px;bottom:12px;z-index:6;max-width:min(360px,calc(100% - 24px));background:#0d0f11eb;border:1px solid var(--line);border-radius:8px;padding:10px 12px;font-size:11px;line-height:1.35;color:var(--text)}
+#conn-diag .head{margin:0 0 6px;font-weight:700;font-size:12px}
+#conn-diag ul{list-style:none;margin:0;padding:0;display:grid;gap:3px}
+#conn-diag li{display:flex;justify-content:space-between;gap:10px}
+#conn-diag li b{font-weight:600}
+#conn-diag li span{opacity:.8;text-align:right}
+#conn-diag li::before{content:"…";width:14px;flex:none}
+#conn-diag li.ok::before{content:"✓";color:var(--lime)}
+#conn-diag li.bad::before{content:"✕";color:#ff6b6b}
+#conn-diag li.wait::before{content:"◌";opacity:.7}
+#conn-diag li b{flex:1}
+#conn-diag .hint{margin:8px 0 4px;color:#ffd27a}
+#conn-diag .retry,#conn-diag .net{margin:4px 0 0;opacity:.75}
+#conn-diag button{margin-top:6px;background:#191c1f;border:1px solid var(--lime);color:var(--lime);border-radius:6px;padding:5px 10px;font-size:11px;font-weight:600}

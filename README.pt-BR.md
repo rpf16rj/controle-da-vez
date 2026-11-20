@@ -75,6 +75,7 @@ O projeto passou por uma rodada de profiling com análise do código do chiaki e
 **Servidor (qualquer Linux, ex.: LXC):**
 - Docker + Docker Compose
 - Opcional: coturn ou qualquer TURN pra jogadores atrás de NAT restritivo
+  - `wan-watch.sh` (cron, 1×/min) mantém o `--external-ip` do coturn e o TURN entregue aos navegadores no IP público atual do host (IP dinâmico / failover de 2 WANs). A WAN precisa aceitar conexões de entrada — CGNAT não aceita.
 - Opcional: proxy reverso/tunnel pra expor o site publicamente
 
 ## Como reproduzir

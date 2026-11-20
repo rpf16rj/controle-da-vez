@@ -75,6 +75,7 @@ The project went through a profiling pass against the chiaki source code and the
 **Server (any Linux box, e.g. an LXC):**
 - Docker + Docker Compose
 - Optional: coturn or any TURN server for players behind restrictive NAT
+  - `wan-watch.sh` (cron, every minute) keeps coturn's `--external-ip` and the TURN host served to browsers in sync with the host's current public IP (dynamic IP / dual-WAN failover). The WAN must accept inbound connections — CGNAT does not.
 - Optional: a reverse proxy / tunnel to expose the site publicly
 
 ## Reproduce

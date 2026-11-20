@@ -64,8 +64,8 @@ TURN_URL = os.environ.get("TURN_URL", "")
 TURN_USER = os.environ.get("TURN_USER", "")
 TURN_PASS = os.environ.get("TURN_PASS", "")
 PS5_HOST = os.environ.get("PS5_HOST", "192.168.0.100")
-PS5_NICKNAME = os.environ.get("PS5_NICKNAME", "PS5-XXX")
-PS5_REGISTKEY = os.environ.get("PS5_REGISTKEY", "<PS5_REGISTKEY>")
+PS5_NICKNAME = os.environ.get("PS5_NICKNAME", "")  # nome do console registrado no chiaki
+PS5_REGISTKEY = os.environ.get("PS5_REGISTKEY", "")  # regist key do chiaki (não versionar)
 CHIAKI_EXE = os.environ.get("CHIAKI_EXE", r"C:\chiaki-ng-Win\chiaki.exe")
 
 FPS = 30
@@ -96,7 +96,10 @@ LATENCY_PROFILES = {
     "balanced": {"playout": (0, 6)},
     "smooth": {"playout": (0, 4095)},
 }
-RTC_STATE = {"fps": 60, "cap": None, "profile": "balanced"}
+# Padrão do jogador: 30fps + latência mínima (o cliente manda o mesmo em
+# rtc-params; casar aqui evita recriar o codec ~160ms no início da sessão).
+RTC_DEFAULT = {"fps": 30, "profile": "ultra"}
+RTC_STATE = {"fps": RTC_DEFAULT["fps"], "cap": None, "profile": RTC_DEFAULT["profile"]}
 
 
 def apply_rtc_params(track, data):
@@ -109,14 +112,18 @@ def apply_rtc_params(track, data):
         track._rtc_cap = None
     elif isinstance(br, (int, float)) and RTC_BITRATE_MIN <= br <= RTC_BITRATE_CEIL:
         track._rtc_cap = int(br)
+    if "swap" in data:
+        # L/R do áudio invertido (celular em landscape invertido) — aplicado
+        # no ChiakiAudioTrack deste pc, que lê esta flag do vtrack.
+        track._audio_swap = bool(data.get("swap"))
     prof = str(data.get("lat", ""))
     if prof in LATENCY_PROFILES:
         track._rtc_profile = prof
         RTC_PLAYOUT["delay"] = LATENCY_PROFILES[prof]["playout"]
         RTC_STATE["profile"] = prof
-    RTC_STATE["fps"] = getattr(track, "_rtc_fps", None) or 60
+    RTC_STATE["fps"] = getattr(track, "_rtc_fps", None) or RTC_DEFAULT["fps"]
     RTC_STATE["cap"] = getattr(track, "_rtc_cap", None)
-    print(f"rtc-params: fps={RTC_STATE['fps']} cap={RTC_STATE['cap']} lat={RTC_STATE['profile']}", flush=True)
+    print(f"rtc-params: fps={RTC_STATE['fps']} cap={RTC_STATE['cap']} lat={RTC_STATE['profile']} swap={getattr(track, '_audio_swap', False)}", flush=True)
 
 
 def set_video_profile(name):
@@ -150,16 +157,20 @@ class HwH264Encoder(H264Encoder):
 
     def _encode_frame(self, frame, force_keyframe):
         fps = self._rtc_fps()
+        # Recria o codec SÓ quando muda geometria/fps/perfil. Recriar o NVENC
+        # custa ~160ms (congela o vídeo) + IDR; antes isso acontecia a cada
+        # variação >10% do REMB (~30× só na rampa 1.2M→20M).
         if self.codec and (
             frame.width != self.codec.width
             or frame.height != self.codec.height
             or self.codec.framerate != Fraction(fps, 1)
             or getattr(self, "_codec_profile", None) != getattr(self, "_rtc_profile", None)
-            or abs(self.target_bitrate - self.codec.bit_rate) / self.codec.bit_rate > 0.1
         ):
             self.buffer_data = b""
             self.buffer_pts = None
             self.codec = None
+        if self.codec is not None:
+            self._maybe_retune_bitrate(fps)
 
         if force_keyframe:
             frame.pict_type = av.video.frame.PictureType.I
@@ -200,6 +211,7 @@ class HwH264Encoder(H264Encoder):
                 # frame → sem rajadas → jitter menor → buffer do receiver
                 # pode ficar no piso. Custa qualidade em cenas complexas.
                 self.codec.options["bufsize"] = str(max(1, self.target_bitrate // fps))
+            self._br_changed_at = time.monotonic()
 
         data_to_send = b""
         _t0 = time.perf_counter()
@@ -210,6 +222,31 @@ class HwH264Encoder(H264Encoder):
 
         if data_to_send:
             yield from self._split_bitstream(data_to_send)
+
+    # Histerese do bitrate do encoder aberto: cada reconfig do nvenc emite
+    # um IDR (frame grande → rajada → GCC do Chrome baixa o REMB → nova
+    # reconfig). Cai na hora quando a rede piora; sobe devagar e em saltos.
+    BR_DROP_RATIO = 0.8
+    BR_RAISE_RATIO = 1.25
+    BR_RAISE_INTERVAL = 2.0
+
+    def _maybe_retune_bitrate(self, fps):
+        want = self.target_bitrate
+        cur = self.codec.bit_rate or want
+        now = time.monotonic()
+        last = getattr(self, "_br_changed_at", 0.0)
+        drop = want < cur * self.BR_DROP_RATIO
+        raise_ = want > cur * self.BR_RAISE_RATIO and now - last >= self.BR_RAISE_INTERVAL
+        if not (drop or raise_):
+            return
+        # Reconfig in-place (FFmpeg nvenc reconfig_encoder): sem os ~160ms
+        # de recriar a sessão.
+        self.codec.bit_rate = want
+        if getattr(self, "_codec_profile", None) == "ultra":
+            self.codec.rc_buffer_size = max(1, want // fps)
+        self._br_changed_at = now
+        ENC["retune"] = ENC.get("retune", 0) + 1
+        print(f"encoder retune: {cur/1e6:.2f}M -> {want/1e6:.2f}M ({'queda' if drop else 'subida'})", flush=True)
 
     @property
     def target_bitrate(self):
@@ -815,6 +852,7 @@ class ChiakiWindowTrack(VideoStreamTrack):
         self._frame_stamp = 0.0
         self._t0 = None
         self._next = 0.0
+        self._cap_dt = 0.0  # intervalo médio entre frames do WGC (EMA)
 
     @staticmethod
     def _to_vframe(img, res):
@@ -828,19 +866,43 @@ class ChiakiWindowTrack(VideoStreamTrack):
             self._start = time.perf_counter()
             self._t0 = None
         _rt0 = time.perf_counter()
-        # Grab instantâneo: com a captura mais rápida que o envio (55fps vs
-        # 30), sempre pega o frame mais fresco sem custo de espera.
-        frame_img, stamp, version = await asyncio.to_thread(self._capture.grab)
-        if version == self._last_version and version > 0:
-            # captura mais lenta que o envio: espera um frame novo pra não
-            # mandar duplicata (pts real-time cobre a diferença de ritmo).
-            frame_img, stamp, version = await asyncio.to_thread(
-                self._capture.grab_new, self._last_version, 0.02
-            )
-        if version != self._last_version:
-            self._frame = frame_img
-            self._frame_stamp = stamp
-            self._last_version = version
+        fps = self._rtc_fps or self._fps
+        period = 1.0 / fps
+        # Pacing guiado pela captura: envia o frame no instante em que o WGC
+        # o entrega (idade ~0) e pula frames só pra respeitar o fps alvo.
+        # Crédito de tempo (self._next) mantém a média exata: um frame é
+        # aceito se chegou a menos de meio intervalo de captura do slot.
+        # Sem frame novo em 1.5 períodos → reenvia o último (stream vivo).
+        while True:
+            if self._frame is None:
+                frame_img, stamp, version = await asyncio.to_thread(self._capture.grab)
+            else:
+                frame_img, stamp, version = await asyncio.to_thread(
+                    self._capture.grab_new, self._last_version, period * 1.5
+                )
+            now = time.perf_counter()
+            fresh = version != self._last_version and frame_img is not None
+            if fresh and self._last_version > 0 and version > self._last_version and self._frame_stamp:
+                dt = (stamp - self._frame_stamp) / (version - self._last_version)
+                if 0 < dt < 0.2:
+                    self._cap_dt = 0.9 * self._cap_dt + 0.1 * dt if self._cap_dt else dt
+            if not self._next:
+                self._next = now
+            slack = (self._cap_dt or period) / 2
+            if fresh and now < self._next - slack:
+                # chegou cedo demais pro fps alvo: guarda (se der timeout é
+                # o mais fresco pra reenviar) e espera o próximo
+                self._frame = frame_img
+                self._last_version = version
+                self._frame_stamp = stamp
+                continue
+            if fresh:
+                self._frame = frame_img
+                self._frame_stamp = stamp
+                self._last_version = version
+            # avança o slot sem acumular dívida de mais de 1 período
+            self._next = max(self._next + period, now - period)
+            break
         if self._frame is None:
             # janela ainda não capturada: frame preto
             self._frame = np.zeros((2, 2, 3), dtype=np.uint8)
@@ -853,7 +915,6 @@ class ChiakiWindowTrack(VideoStreamTrack):
         # pts = instante real da captura. Com pts por índice, qualquer atraso
         # de produção acumulava como latência de stream ("lentidão" com stats
         # boas); agora um frame atrasado pula pra posição de tempo correta.
-        fps = self._rtc_fps or self._fps
         if self._t0 is None:
             self._t0 = self._frame_stamp
         pts = max(self._count, int((self._frame_stamp - self._t0) * fps + 0.5))
@@ -861,26 +922,23 @@ class ChiakiWindowTrack(VideoStreamTrack):
         vf.pts = pts
         vf.time_base = Fraction(1, fps)
         TRACKS[self._tag]["n"] += 1
-        # Pacing desacoplado do pts: avança 1/fps por envio mas nunca vai pro
-        # futuro — se o pts pulou por um gap de captura, não transforma isso
-        # em stall de produção (era o que derrubava o track pra ~21fps).
-        now = time.perf_counter()
-        if not self._next:
-            self._next = now
-        self._next += 1.0 / fps
-        wait = self._next - now
-        if wait < -0.1:
-            self._next = now  # muito atrasado: realinha em vez de disparar rajada
-        else:
-            # time.sleep honra timeBeginPeriod (asyncio.sleep tem ~15ms de
-            # granularidade no Windows) — pacing real de ~30fps.
-            await asyncio.to_thread(time.sleep, max(0.0, wait))
+        if self._res is None:
+            FRAME_AGE["ms"] += (time.perf_counter() - self._frame_stamp) * 1000
+            FRAME_AGE["n"] += 1
         TRACKS[self._tag]["ms"] = TRACKS[self._tag].get("ms", 0) + (time.perf_counter() - _rt0) * 1000
         return vf
 
 
 AUDIO_SR = 48000
 AUDIO_BLOCK = 960  # 20 ms
+# Fila máx de áudio capturado e ainda não enviado. O RTCP SR carimba o RTP
+# com a hora do ENVIO, então tudo que fica na fila vira atraso do áudio em
+# relação ao vídeo no browser. Com 300ms a fila enchia no início da conexão
+# (captura começa antes do ICE) e nunca mais esvaziava (consumo = produção).
+AUDIO_MAX_LAG_S = 0.05
+AUDIO_TARGET_LAG_S = 0.025
+# Idade média da fila de áudio no recv (diag "abuf").
+AUDIO_LAG = {"n": 0, "ms": 0.0}
 
 
 def _boost_app_volume(pid):
@@ -905,6 +963,7 @@ class ChiakiAudioTrack(AudioStreamTrack):
         from collections import deque
         from proctap import ProcessAudioCapture
         self._chunks = deque()
+        self._chunks_samples = 0  # amostras (float32, L+R intercalado) em _chunks
         self._pending = np.zeros(0, dtype=np.float32)
         self._lock = threading.Lock()
         self._count = 0
@@ -917,11 +976,15 @@ class ChiakiAudioTrack(AudioStreamTrack):
     def _on_data(self, pcm, _frames):
         with self._lock:
             self._chunks.append(pcm)
-            # Backlog máx ~300ms (estéreo = 2 amostras/frame): antes era ~2s
-            # e o áudio podia ficar 2s atrás do vídeo depois de qualquer engasgo.
-            cap = int(AUDIO_SR * 2 * 0.3)
-            while sum(len(c) for c in self._chunks) > cap and len(self._chunks) > 1:
-                self._chunks.popleft()
+            self._chunks_samples += len(pcm) // 4
+            # Backlog máx AUDIO_MAX_LAG_S (era 300ms — e ficava cheio).
+            # len(pcm) é em bytes; float32 estéreo = 4 bytes/amostra.
+            cap = int(AUDIO_SR * 2 * AUDIO_MAX_LAG_S)
+            if self._chunks_samples + self._pending.size > cap:
+                # Estourou: desce até o alvo (não fica encostado no teto).
+                target = int(AUDIO_SR * 2 * AUDIO_TARGET_LAG_S)
+                while self._chunks_samples + self._pending.size > target and len(self._chunks) > 1:
+                    self._chunks_samples -= len(self._chunks.popleft()) // 4
 
     async def recv(self):
         if self._start is None:
@@ -929,14 +992,21 @@ class ChiakiAudioTrack(AudioStreamTrack):
         await asyncio.sleep(max(0, self._start + self._count * AUDIO_BLOCK / AUDIO_SR - time.perf_counter()))
         need = AUDIO_BLOCK * 2
         with self._lock:
+            AUDIO_LAG["ms"] += (self._pending.size + self._chunks_samples) / 2 / AUDIO_SR * 1000
+            AUDIO_LAG["n"] += 1
             while self._pending.size < need and self._chunks:
-                data = np.frombuffer(self._chunks.popleft(), dtype=np.float32)
+                raw = self._chunks.popleft()
+                self._chunks_samples -= len(raw) // 4
+                data = np.frombuffer(raw, dtype=np.float32)
                 self._pending = np.concatenate([self._pending, data])
             if self._pending.size >= need:
                 take = self._pending[:need]
                 self._pending = self._pending[need:]
             else:
                 take = np.zeros(need, dtype=np.float32)
+                AUDIO_LAG["under"] = AUDIO_LAG.get("under", 0) + 1
+        if getattr(getattr(self, "_swap_src", None), "_audio_swap", False):
+            take = take.reshape(-1, 2)[:, ::-1].ravel()
         pcm16 = (np.clip(take, -1.0, 1.0) * 32767).astype(np.int16)
         frame = av.AudioFrame.from_ndarray(pcm16.reshape(1, -1), format="s16", layout="stereo")
         frame.sample_rate = AUDIO_SR
@@ -1010,17 +1080,72 @@ async def grant_watchdog():
             reset_all_relays()
 
 
+# Rumble: o chiaki manda vibração pro X360 virtual (XInputSetState) →
+# notificação do ViGEm (thread própria) → event loop → DataChannel do
+# dispositivo que detém o controle. O canal é unordered/sem retransmissão,
+# então o estado é repetido a cada 150ms enquanto vibra (o cliente usa
+# efeitos de 300ms renovados) e o "parar" sai 3×.
+RUMBLE = {"l": 0, "s": 0, "loop": None, "events": 0, "zero_left": 0, "max": 0}
+# O chiaki converte o háptico do DualSense em rumble fraquíssimo (GTA: pico
+# ~0.03–0.05 de 1.0) — ninguém sente. Ganho aplicado no envio, com clip.
+RUMBLE_GAIN = float(os.environ.get("RUMBLE_GAIN", "15"))
+
+
+def _rumble_send():
+    ch = getattr(CONTROL["relay"], "channel", None)
+    if ch is None or ch.readyState != "open":
+        return
+    try:
+        g = RUMBLE_GAIN / 255
+        ch.send(json.dumps({"type": "rumble", "l": round(min(1.0, RUMBLE["l"] * g), 3), "s": round(min(1.0, RUMBLE["s"] * g), 3)}))
+    except Exception:
+        pass
+
+
+def _rumble_update(large, small):
+    if (large, small) == (RUMBLE["l"], RUMBLE["s"]):
+        return
+    RUMBLE.update(l=large, s=small)
+    RUMBLE["events"] += 1
+    RUMBLE["max"] = max(RUMBLE["max"], large, small)
+    RUMBLE["zero_left"] = 3 if not (large or small) else 0
+    _rumble_send()
+
+
+def _on_rumble(client, target, large_motor, small_motor, led_number, user_data):
+    loop = RUMBLE["loop"]
+    if loop is not None:
+        loop.call_soon_threadsafe(_rumble_update, int(large_motor), int(small_motor))
+
+
+async def rumble_repeater():
+    while True:
+        await asyncio.sleep(0.15)
+        if RUMBLE["l"] or RUMBLE["s"]:
+            _rumble_send()
+        elif RUMBLE["zero_left"] > 0:
+            RUMBLE["zero_left"] -= 1
+            _rumble_send()
+
+
 def get_pad():
     global _PAD
     if _PAD is None:
         _PAD = VX360Gamepad()
+        try:
+            RUMBLE["loop"] = asyncio.get_running_loop()
+            _PAD.register_notification(callback_function=_on_rumble)
+        except Exception as exc:
+            print("rumble: notificação não registrada:", repr(exc), flush=True)
     return _PAD
 
 
 class InputRelay:
     """DataChannel -> controle virtual X360. Neutraliza ao desconectar."""
 
-    MAX_MSG_PER_SEC = 240  # 60Hz nominal; rajadas de intervalo clumped não devem derrubar input
+    # Cliente amostra a 250Hz e envia na mudança (+keepalive 50ms): stick
+    # analógico em movimento contínuo chega perto de 250/s.
+    MAX_MSG_PER_SEC = 500
 
     def __init__(self):
         self.buttons = set()
@@ -1109,9 +1234,12 @@ async def offer(request):
     ACTIVE_RELAYS.add(relay)
     # Referência fixa pro datachannel aplicar rtc-params neste track.
     vtrack = ChiakiWindowTrack(fps=60)
-    # Sessão nova começa no perfil padrão — não herda o clamp da anterior.
-    RTC_PLAYOUT["delay"] = LATENCY_PROFILES["balanced"]["playout"]
-    RTC_STATE.update({"fps": 60, "cap": None, "profile": "balanced"})
+    # Sessão nova começa no perfil padrão (30fps/ultra) — não herda o clamp
+    # da anterior e já nasce igual ao default do cliente.
+    vtrack._rtc_fps = RTC_DEFAULT["fps"]
+    vtrack._rtc_profile = RTC_DEFAULT["profile"]
+    RTC_PLAYOUT["delay"] = LATENCY_PROFILES[RTC_DEFAULT["profile"]]["playout"]
+    RTC_STATE.update({"fps": RTC_DEFAULT["fps"], "cap": None, "profile": RTC_DEFAULT["profile"]})
 
     async def cleanup(_=None):
         PLAYER_PCS.discard(pc)
@@ -1217,6 +1345,7 @@ async def offer(request):
             relay.reset()
             print(relay.stats(), flush=True)
 
+        relay.channel = channel  # rumble volta por aqui quando este relay comanda
         channel.on("open", lambda: print("datachannel 'input' aberto", flush=True))
         channel.on("message", on_message)
         channel.on("close", on_close)
@@ -1235,6 +1364,7 @@ async def offer(request):
     if capture.pid and "m=audio" in data.get("sdp", ""):
         try:
             audio_track = ChiakiAudioTrack(capture.pid)
+            audio_track._swap_src = vtrack  # flag _audio_swap vem do rtc-params
             pc.addTrack(audio_track)
         except Exception as exc:
             print("audio track falhou:", repr(exc), flush=True)
@@ -1284,10 +1414,23 @@ async def offer(request):
             print("OFR| " + line.strip(), flush=True)
 
     offer_sdp = RTCSessionDescription(sdp=sdp_in, type=data.get("type", "offer"))
+    _t_offer = time.perf_counter()
     try:
         await pc.setRemoteDescription(offer_sdp)
         answer = await pc.createAnswer()
         await pc.setLocalDescription(answer)
+        # Tempo de resposta + candidatos (o aiortc junta tudo antes do answer):
+        # diagnóstico de conexão lenta/falha de quem joga de fora.
+        _kinds = {}
+        for _ln in sdp_in.splitlines():
+            if _ln.startswith("a=candidate:"):
+                _t = _ln.split(" typ ")[1].split()[0] if " typ " in _ln else "?"
+                _kinds["in_" + _t] = _kinds.get("in_" + _t, 0) + 1
+        for _ln in pc.localDescription.sdp.splitlines():
+            if _ln.startswith("a=candidate:"):
+                _t = _ln.split(" typ ")[1].split()[0] if " typ " in _ln else "?"
+                _kinds[_t] = _kinds.get(_t, 0) + 1
+        print(f"offer: answer em {(time.perf_counter() - _t_offer) * 1000:.0f}ms candidatos {_kinds}", flush=True)
         # debug: o que devolvemos pro cliente (codecs/fmtp/extmap do answer)
         in_video = False
         for line in pc.localDescription.sdp.splitlines():
@@ -1534,6 +1677,8 @@ PUBLISHER = WhipPublisher()
 # ---------- Diagnóstico: taxa de captura x produção, lag do loop ----------
 TRACKS = {}
 ENC = {"n": 0, "ms": 0.0}
+# Idade do frame (captura WGC → entregue ao encoder) só no track do jogador.
+FRAME_AGE = {"n": 0, "ms": 0.0}
 LOOP_LAG = {"max": 0.0}
 
 
@@ -1571,6 +1716,19 @@ async def diag_stats():
         if ENC["n"]:
             parts.append(f"enc={ENC['ms'] / ENC['n']:.1f}ms")
             ENC["n"] = ENC["ms"] = 0
+        if RUMBLE["events"]:
+            parts.append(f"rumble={RUMBLE['events']}/max{RUMBLE['max'] / 255:.2f}")
+            RUMBLE["events"] = RUMBLE["max"] = 0
+        if ENC.get("retune"):
+            parts.append(f"retune={ENC['retune']}")
+            ENC["retune"] = 0
+        if AUDIO_LAG["n"]:
+            parts.append(f"abuf={AUDIO_LAG['ms'] / AUDIO_LAG['n']:.0f}ms/under{AUDIO_LAG.get('under', 0)}")
+            AUDIO_LAG["n"] = AUDIO_LAG["ms"] = 0
+            AUDIO_LAG["under"] = 0
+        if FRAME_AGE["n"]:
+            parts.append(f"age={FRAME_AGE['ms'] / FRAME_AGE['n']:.1f}ms")
+            FRAME_AGE["n"] = FRAME_AGE["ms"] = 0
         prev_v, prev_t = cap.version, now
         print("diag " + " ".join(parts), flush=True)
 
@@ -1633,6 +1791,13 @@ def make_app():
         asyncio.ensure_future(publish_supervisor())
         asyncio.ensure_future(loop_lag())
         asyncio.ensure_future(diag_stats())
+        asyncio.ensure_future(rumble_repeater())
+        # Cria o pad já no boot: o chiaki precisa enxergar o X360 virtual
+        # antes do 1º input, e o callback de rumble nasce junto.
+        try:
+            get_pad()
+        except Exception as exc:
+            print("pad virtual falhou no boot:", repr(exc), flush=True)
 
     app.on_startup.append(_startup)
     app.router.add_post("/offer", offer)

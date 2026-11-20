@@ -9,6 +9,7 @@ $env:TURN_USER = '<TURN_USER>'
 $env:TURN_PASS = '<TURN_PASSWORD>'
 $env:PS5_HOST = '<PS5_LAN_IP>'          # PS5 IP on your LAN
 $env:PS5_NICKNAME = 'PS5-XXX'           # nickname you registered in chiaki
+$env:PS5_REGISTKEY = '<PS5_REGISTKEY>'  # regist key from chiaki's registration (keep private)
 # $env:CHIAKI_EXE = 'C:\chiaki-ng-Win\chiaki.exe'
 Set-Location $PSScriptRoot
 & "$PSScriptRoot\.venv\Scripts\python.exe" "$PSScriptRoot\agent.py"
