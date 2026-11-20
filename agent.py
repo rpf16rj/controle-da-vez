@@ -672,6 +672,7 @@ class ChiakiCapture:
         self.alive = False
         self.cv = threading.Condition()
         self.cap = None
+        self._ctl = None            # CaptureControl — stop() real do thread WGC
         self._bad = {}  # hwnd -> monotonic até quando pular (janela sem frames)
         self.ensure()
 
@@ -713,12 +714,25 @@ class ChiakiCapture:
             self.alive = False
 
         self.cap.closed_handler = on_closed
-        self.cap.start_free_threaded()
+        try:
+            self._ctl = self.cap.start_free_threaded()
+        except Exception:
+            # Sessão nasce morta (transição de fullscreen do chiaki, OOM do
+            # DirectX): solta tudo. Sem isso cada retry deixava uma captura
+            # fantasma rodando 60fps de memcpy até CPU/GPU irem a 100%.
+            self.cap = None
+            self.alive = False
+            self._ctl = None
+            raise
 
     def _detach(self):
-        # windows_capture não expõe stop: o thread interno continua, mas o
-        # callback vira no-op (self.cap is not cap_obj) e fica ocioso.
         self.alive = False
+        ctl, self._ctl = self._ctl, None
+        if ctl is not None:
+            try:
+                ctl.stop()  # encerra o thread da sessão WGC de verdade
+            except Exception:
+                pass
         self.cap = None
         self.latest = None
 
@@ -740,7 +754,14 @@ class ChiakiCapture:
         for hwnd, _ in find_chiaki_windows():
             if time.monotonic() < self._bad.get(hwnd, 0):
                 continue
-            self._attach(hwnd)
+            try:
+                self._attach(hwnd)
+            except Exception:
+                # Attach explodiu (DirectX OOM em transição de fullscreen) —
+                # mesma punição de 12s do "sem frames": sem ela o supervisor
+                # rearmava uma sessão nova a cada 2s e afogava a GPU.
+                self._bad[hwnd] = time.monotonic() + 12
+                continue
             if self._wait_fresh(1.5):
                 self._bad.pop(hwnd, None)
                 return True
